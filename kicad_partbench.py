@@ -162,6 +162,93 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
             log(f"[FP] ERROR updating 3D for {mod_path}: {e}")
     return updated
 
+
+def _available_models(models_root: Path):
+    avail = {}
+    if models_root.exists():
+        for f in models_root.rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".step",".stp",".wrl"):
+                avail.setdefault(f.name.lower(), f)
+                avail.setdefault(f.stem.lower(), f)
+    return avail
+
+def _parse_models_from_mod(txt: str):
+    models = []
+    for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt):
+        models.append(m.group(1) or m.group(2))
+    return models
+
+def _choose_local_model(avail: dict, key_stem: str):
+    for ext in (".step",".stp",".wrl"):
+        k = (key_stem + ext).lower()
+        if k in avail:
+            return avail[k]
+    return avail.get(key_stem.lower())
+
+def _rewrite_model_block(txt: str, local_path: Path):
+    rel = "${PERSONAL_LIB_DIR}/3d/" + ( "step/" if local_path.suffix.lower() in (".step",".stp") else "wrl/" ) + local_path.name
+    def repl(m):
+        _ = m.group(0)
+        return re.sub(r'\(model\s+(?:"[^"]+"|[^\s)]+)', f'(model "{rel}"', _)
+    return re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', repl, txt, count=1)
+
+def _append_model_block(txt: str, local_path: Path):
+    rel = "${PERSONAL_LIB_DIR}/3d/" + ( "step/" if local_path.suffix.lower() in (".step",".stp") else "wrl/" ) + local_path.name
+    insert = f'\n  (model "{rel}")\n'
+    if txt.rstrip().endswith(')'):
+        return txt.rstrip()[:-1] + insert + ")\n"
+    return txt + insert
+
+def audit_footprints(fp_dir: Path, models_root: Path):
+    rows = []
+    avail = _available_models(models_root)
+    for mod_path in sorted(fp_dir.glob("*.kicad_mod"), key=lambda p: p.name.lower()):
+        txt = mod_path.read_text(encoding="utf-8", errors="ignore")
+        models = _parse_models_from_mod(txt)
+        if not models:
+            status, icon = ("None","❌"); found = 0; total = 0
+        else:
+            total = len(models); found = 0
+            for mpath in models:
+                base = Path(mpath.replace("\\","/")).name
+                stem = Path(base).stem
+                if base.lower() in avail or _choose_local_model(avail, stem):
+                    found += 1
+            if found == 0: status, icon = ("None","❌")
+            elif found == total: status, icon = ("All","✅")
+            else: status, icon = ("Partial","⚠️")
+        rows.append((mod_path.stem, status, icon, f"{found}/{total}"))
+    return rows
+
+def fix_footprint_models(fp_dir: Path, models_root: Path, dry_run: bool=True, add_if_missing: bool=True):
+    avail_full = _available_models(models_root)
+    changed = 0; total = 0; modified = []
+    for mod_path in sorted(fp_dir.glob("*.kicad_mod"), key=lambda p: p.name.lower()):
+        total += 1
+        txt = mod_path.read_text(encoding="utf-8", errors="ignore")
+        models = _parse_models_from_mod(txt)
+        new_txt = txt
+        if models:
+            for mpath in models:
+                base = Path(mpath.replace("\\","/")).name
+                stem = Path(base).stem
+                local = avail_full.get(base.lower()) or _choose_local_model(avail_full, stem)
+                if local:
+                    new_txt = _rewrite_model_block(new_txt, local)
+        elif add_if_missing:
+            stem = mod_path.stem
+            local = _choose_local_model(avail_full, stem)
+            if local:
+                new_txt = _append_model_block(new_txt, local)
+        if new_txt != txt:
+            changed += 1; modified.append(mod_path)
+            if not dry_run:
+                bak = mod_path.with_suffix(".kicad_mod.bak")
+                try: mod_path.rename(bak)
+                except Exception: pass
+                mod_path.write_text(new_txt, encoding="utf-8")
+    return changed, total, modified
+
 # -------------------- Symbols: parse/sanitize/hash --------------------
 def parse_symbol_blocks(text: str):
     blocks = []
@@ -428,6 +515,8 @@ class App(tk.Tk):
         tk.Button(btn_row, text="Import", command=self.run).pack(side="left", padx=4)
         tk.Button(btn_row, text="Validate/Repair symbols.kicad_sym", command=self.repair_now).pack(side="left", padx=4)
         tk.Button(btn_row, text="View Library Parts", command=self.view_library_parts).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Audit Footprints (3D)", command=self.audit_footprints_gui).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Fix 3D Paths…", command=self.fix_3d_paths_gui).pack(side="left", padx=4)
         tk.Button(btn_row, text="Export Report", command=self.export_report).pack(side="left", padx=4)
         tk.Button(btn_row, text="Quit", command=self.destroy).pack(side="right", padx=4); r += 1
 
@@ -602,6 +691,61 @@ class App(tk.Tk):
         backup = write_symbols_file(sym, merged)
         self.logprint(f"   Wrote clean symbols file. Backup at: {backup}")
         messagebox.showinfo("Repaired", "symbols.kicad_sym rebuilt successfully.")
+
+    def audit_footprints_gui(self):
+        personal = Path(self.personal.get()).expanduser()
+        fp_dir = personal / "footprints.pretty"
+        models_root = personal / "3d"
+        if not fp_dir.exists():
+            messagebox.showerror("Error", f"No footprints.pretty at: {fp_dir}"); return
+        rows = audit_footprints(fp_dir, models_root)
+        win = tk.Toplevel(self); win.title("Footprints 3D Audit"); win.geometry("900x600")
+        ok = sum(1 for _,s,_,_ in rows if s=="All"); part = sum(1 for _,s,_,_ in rows if s=="Partial"); none = sum(1 for _,s,_,_ in rows if s=="None")
+        tk.Label(win, text=f"Footprints: {len(rows)}   |   3D: All {ok}, Partial {part}, None {none}").pack(anchor="w", padx=8, pady=6)
+        cols = ("Footprint Module","3D","Models Found")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=24)
+        for col,w in (("Footprint Module",520),("3D",160),("Models Found",160)):
+            tree.heading(col, text=col); tree.column(col, width=w, anchor="center" if col!="Footprint Module" else "w")
+        for mod, status, icon, cnt in rows:
+            tree.insert("", "end", values=(mod, f"{icon} {status}", cnt))
+        tree.pack(fill="both", expand=True, padx=8, pady=8)
+        def export_csv():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"footprints_3d_audit_{ts}.csv")
+            if not path: return
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f); w.writerow(cols)
+                for mod, status, icon, cnt in rows:
+                    w.writerow((mod, status, cnt))
+            messagebox.showinfo("Saved", f"Exported {len(rows)} rows.")
+        btns = tk.Frame(win); btns.pack(fill="x", padx=8, pady=(0,8))
+        tk.Button(btns, text="Export CSV", command=export_csv).pack(side="left")
+        tk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+    def fix_3d_paths_gui(self):
+        personal = Path(self.personal.get()).expanduser()
+        fp_dir = personal / "footprints.pretty"
+        models_root = personal / "3d"
+        if not fp_dir.exists():
+            messagebox.showerror("Error", f"No footprints.pretty at: {fp_dir}"); return
+
+        win = tk.Toplevel(self); win.title("Fix 3D Paths in Footprints"); win.geometry("560x260")
+        dry = tk.BooleanVar(value=True)
+        add_missing = tk.BooleanVar(value=True)
+        tk.Checkbutton(win, text="Dry run (show what would change; don't write files)", variable=dry).pack(anchor="w", padx=12, pady=8)
+        tk.Checkbutton(win, text="Add (model …) to footprints that have none (by filename match)", variable=add_missing).pack(anchor="w", padx=12, pady=4)
+        out = ScrolledText(win, wrap="word", height=8); out.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def run_fix():
+            changed, total, mods = fix_footprint_models(fp_dir, models_root, dry_run=dry.get(), add_if_missing=add_missing.get())
+            out.insert("end", f"{'Dry run' if dry.get() else 'Wrote'}: {changed} of {total} footprints would be/was updated.\n")
+            for m in mods[:200]:
+                out.insert("end", f" - {m.name}\n")
+            out.see("end")
+            messagebox.showinfo("Done", f"{'Dry run' if dry.get() else 'Updated'} {changed} of {total} footprints.")
+        tk.Button(win, text="Run", command=run_fix).pack(side="left", padx=12, pady=6)
+        tk.Button(win, text="Close", command=win.destroy).pack(side="right", padx=12, pady=6)
 
     # ---------- Library listing ----------
     def view_library_parts(self):
