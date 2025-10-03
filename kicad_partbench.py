@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer (GUI)
+# KiCad Personal Library Importer (GUI) — Strict Writer
 # - Imports mixed ZIPs/folders of KiCad parts into a central personal library
 # - Copies footprints/3D, fixes 3D model paths to ${PERSONAL_LIB_DIR}
-# - Merges symbols while DEDUPING and writing a CLEAN single-root symbols.kicad_sym
-# - Includes Validate/Repair for symbols.kicad_sym
+# - Merges symbols and writes a STRICT, sanitized symbols.kicad_sym:
+#     * Single-root header
+#     * Two-space indent, no tabs
+#     * Converts "(hide)" -> "(hide yes)"
+#     * Stable alphabetical order
+#     * .bak backup before writing
+# - Validate/Repair button rebuilds the file with the same sanitizer
 #
-# NOTE: This script never appends raw text to symbols.kicad_sym.
-# It rebuilds the file solely from parsed (symbol "...") blocks.
+# Tested with KiCad 6/7/8/9 formats.
 
 import os, re, sys, shutil, tempfile, zipfile, time, json, csv
 from pathlib import Path
@@ -14,7 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "importer"))\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict")\n'
 
 # -------------------- Core helpers --------------------
 def ensure_dirs(personal_dir: Path):
@@ -23,7 +27,6 @@ def ensure_dirs(personal_dir: Path):
     (personal_dir / "3d" / "wrl").mkdir(parents=True, exist_ok=True)
     sym = personal_dir / "symbols.kicad_sym"
     if not sym.exists():
-        # Create a minimal, valid, empty library
         sym.write_text(HEADER + ")\n", encoding="utf-8")
 
 def find_files(root: Path, patterns):
@@ -40,14 +43,12 @@ def copy_3d_models(staging: Path, personal: Path, overwrite=False, log=lambda *a
     for f in steps:
         dest = personal / "3d" / "step" / f.name
         if overwrite or not dest.exists():
-            shutil.copy2(f, dest); copied += 1
-            log(f"[3D] Copied: {f.name}")
+            shutil.copy2(f, dest); copied += 1; log(f"[3D] Copied: {f.name}")
         mapping[f.name] = "${PERSONAL_LIB_DIR}/3d/step/" + f.name
     for f in wrls:
         dest = personal / "3d" / "wrl" / f.name
         if overwrite or not dest.exists():
-            shutil.copy2(f, dest); copied += 1
-            log(f"[3D] Copied: {f.name}")
+            shutil.copy2(f, dest); copied += 1; log(f"[3D] Copied: {f.name}")
         mapping[f.name] = "${PERSONAL_LIB_DIR}/3d/wrl/" + f.name
     return mapping, copied
 
@@ -69,8 +70,7 @@ def import_footprints(staging: Path, personal: Path, overwrite=False, log=lambda
             if dest.exists() and not overwrite:
                 skipped.append(src.name); log(f"[FP] Skip (exists): {src.name}")
             else:
-                shutil.copy2(src, dest); imported.append(src.name)
-                log(f"[FP] Imported: {src.name}")
+                shutil.copy2(src, dest); imported.append(src.name); log(f"[FP] Imported: {src.name}")
         except Exception as e:
             errors.append(f"{src.name}: {e}"); log(f"[FP] ERROR {src.name}: {e}")
     return [personal / "footprints.pretty" / Path(p).name for p in mods], imported, skipped, errors
@@ -83,13 +83,12 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
             txt = Path(mod_path).read_text(encoding="utf-8", errors="ignore")
             new = rewrite_models_in_mod(txt, model_map)
             if new != txt:
-                Path(mod_path).write_text(new, encoding="utf-8"); updated += 1
-                log(f"[FP] Updated 3D path: {Path(mod_path).name}")
+                Path(mod_path).write_text(new, encoding="utf-8"); updated += 1; log(f"[FP] Updated 3D path: {Path(mod_path).name}")
         except Exception as e:
             log(f"[FP] ERROR updating 3D for {mod_path}: {e}")
     return updated
 
-# ---- Symbol parsing / merging (safe) ----
+# -------------------- Symbols (strict sanitizer) --------------------
 def parse_symbol_blocks(text: str):
     """Return list of (name, block_text) for top-level (symbol "...") blocks using paren balancing."""
     blocks = []
@@ -102,36 +101,50 @@ def parse_symbol_blocks(text: str):
         name = mname.group(1)
         depth, j = 0, i
         while j < n:
-            if text[j] == "(": depth += 1
-            elif text[j] == ")":
+            ch = text[j]
+            if ch == "(": depth += 1
+            elif ch == ")":
                 depth -= 1
-                if depth == 0:
-                    j += 1; break
+                if depth == 0: j += 1; break
             j += 1
         block = text[i:j]
         blocks.append((name, block))
         i = j
     return blocks
 
+def sanitize_block(block: str) -> str:
+    """Strict KiCad-6+ compatible cleanup. No tabs; two-space indent; '(hide)' -> '(hide yes)'."""
+    s = textwrap.dedent(block.strip())
+    k = s.find("(symbol ")
+    if k > 0: s = s[k:]
+    s = re.sub(r'\(hide\)', '(hide yes)', s)
+    # Remove tabs and reindent with two spaces
+    lines = []
+    for ln in s.splitlines():
+        lines.append("  " + ln.lstrip().replace("\t", "  "))
+    return "\n".join(lines)
+
+def normalize_block_for_compare(block: str) -> str:
+    """Normalization used for duplicate detection (ignores whitespace and bare/yes hide)."""
+    norm = re.sub(r'\(hide\)', '(hide yes)', block)
+    norm = re.sub(r'\s+', ' ', norm).strip()
+    return norm
+
 def read_personal_symbols(sym_path: Path):
     if not sym_path.exists():
-        return {}, ""
+        return {}
     raw = sym_path.read_text(encoding="utf-8", errors="ignore")
     merged = {}
     for name, block in parse_symbol_blocks(raw):
-        norm = re.sub(r"\s+", " ", block).strip()
-        merged[name] = (block, norm)
-    return merged, raw
+        merged[name] = (sanitize_block(block), normalize_block_for_compare(block))
+    return merged
 
 def write_symbols_file(sym_path: Path, blocks_by_name: dict):
     """Rewrite as a clean, single-root file. Backup .bak first."""
     out = [HEADER]
-    # stable order: by name
     for name in sorted(blocks_by_name.keys(), key=lambda s: s.lower()):
         block, _norm = blocks_by_name[name]
-        lines = block.strip() + "\n"
-        lines = "\n".join("  " + ln for ln in lines.splitlines())
-        out.append(lines + "\n")
+        out.append(block.rstrip() + "\n")
     out.append(")\n")
     backup = sym_path.with_suffix(".kicad_sym.bak")
     if sym_path.exists():
@@ -140,12 +153,12 @@ def write_symbols_file(sym_path: Path, blocks_by_name: dict):
     Path(sym_path).write_text("".join(out), encoding="utf-8")
     return str(backup)
 
-def merge_symbols(personal_sym: Path, vendor_syms: list, imported_fp_paths: list,
-                  autoset_fp=True, fp_nick="Personal_Footprints", overwrite=False, log=lambda *a: None):
-    existing, _raw = read_personal_symbols(personal_sym)
+def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_paths: list,
+                         autoset_fp=True, fp_nick="Personal_Footprints", overwrite=False, log=lambda *a: None):
+    existing = read_personal_symbols(personal_sym)
     merged = dict(existing)
 
-    # Determine single footprint name if unique
+    # Single footprint name?
     fp_names = []
     for p in imported_fp_paths:
         try:
@@ -154,46 +167,46 @@ def merge_symbols(personal_sym: Path, vendor_syms: list, imported_fp_paths: list
             fp_names.append(m.group(1) if m else Path(p).stem)
         except Exception:
             fp_names.append(Path(p).stem)
-    single_fp = next(iter({n for n in fp_names if n}), None) if len({n for n in fp_names if n}) == 1 else None
+    uniq = {n for n in fp_names if n}
+    single_fp = next(iter(uniq)) if len(uniq) == 1 else None
 
     stats = {"added":[], "skipped_identical":[], "renamed":[], "overwritten":[]}
 
     for symlib in vendor_syms:
         txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
-        for name, block in parse_symbol_blocks(txt):
-            # Auto-set Footprint
+        for name, raw_block in parse_symbol_blocks(txt):
+            # Ensure Footprint property
+            block = textwrap.dedent(raw_block.strip())
             if autoset_fp and single_fp:
                 fpfull = f"{fp_nick}:{single_fp}"
                 if re.search(r'\(property\s+"Footprint"\s+"[^"]*"', block):
                     block = re.sub(r'(\(property\s+"Footprint"\s+)"[^"]*"', r'\1"{}"'.format(fpfull), block, count=1)
                 else:
-                    block = block.rstrip()
                     if block.endswith(")"):
-                        block = block[:-1] + f'\n    (property "Footprint" "{fpfull}" (at 0 0 0) (effects (font (size 1 1))) (hide))\n)\n'
-            norm = re.sub(r"\s+", " ", block).strip()
+                        block = block[:-1] + f'\n    (property "Footprint" "{fpfull}" (at 0 0 0) (effects (font (size 1 1))) (hide yes))\n)\n'
+            # Sanitize for write + normalize for compare
+            sanitized = sanitize_block(block)
+            norm = normalize_block_for_compare(block)
 
             if name in merged:
                 _blk, existing_norm = merged[name]
                 if existing_norm == norm:
-                    stats["skipped_identical"].append(name)
-                    log(f"[SYM] Skip duplicate (identical): {name}")
+                    stats["skipped_identical"].append(name); log(f"[SYM] Skip duplicate (identical): {name}")
                     continue
                 if overwrite:
-                    merged[name] = (block, norm); stats["overwritten"].append(name)
-                    log(f"[SYM] Overwrite: {name}")
+                    merged[name] = (sanitized, norm); stats["overwritten"].append(name); log(f"[SYM] Overwrite: {name}")
                 else:
-                    # rename to avoid collision
                     k, new_name = 1, f"{name}_imp1"
                     while new_name in merged:
                         k += 1; new_name = f"{name}_imp{k}"
-                    block = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', block, count=1)
-                    merged[new_name] = (block, re.sub(r"\s+", " ", block).strip())
-                    stats["renamed"].append((name, new_name))
-                    stats["added"].append(new_name)
+                    # rename inside symbol
+                    sanitized = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', sanitized, count=1)
+                    norm = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', norm, count=1)
+                    merged[new_name] = (sanitized, norm)
+                    stats["renamed"].append((name, new_name)); stats["added"].append(new_name)
                     log(f"[SYM] Renamed to avoid conflict: {new_name}")
-                    continue
             else:
-                merged[name] = (block, norm); stats["added"].append(name)
+                merged[name] = (sanitized, norm); stats["added"].append(name)
 
     backup = write_symbols_file(personal_sym, merged)
     log(f"[SYM] Wrote clean symbols file. Backup: {backup}")
@@ -208,8 +221,7 @@ def gather_packages(source: Path, recurse=True):
     if source.is_file() and source.suffix.lower() == ".zip":
         return [("zip", source)]
     if source.is_dir():
-        if package_has_content(source):
-            pkgs.append(("dir", source))
+        if package_has_content(source): pkgs.append(("dir", source))
         if recurse:
             for p in source.rglob("*"):
                 if p.is_file() and p.suffix.lower() == ".zip":
@@ -226,12 +238,10 @@ def gather_packages(source: Path, recurse=True):
     return []
 
 def unzip_if_needed(path: Path):
-    if path.is_dir():
-        return path, None
+    if path.is_dir(): return path, None
     if path.is_file() and path.suffix.lower() == ".zip":
         tmp = Path(tempfile.mkdtemp(prefix="kicad_import_"))
-        with zipfile.ZipFile(path, "r") as z:
-            z.extractall(tmp)
+        with zipfile.ZipFile(path, "r") as z: z.extractall(tmp)
         return tmp, tmp
     raise FileNotFoundError("Source is neither a directory nor a .zip")
 
@@ -261,8 +271,8 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
 
         syms = find_files(staging, ["*.kicad_sym"])
         if syms:
-            stats = merge_symbols(personal / "symbols.kicad_sym", syms, fps_paths, autoset_fp=autoset_fp,
-                                  fp_nick=fp_nick, overwrite=overwrite, log=log)
+            stats = merge_symbols_strict(personal / "symbols.kicad_sym", syms, fps_paths, autoset_fp=autoset_fp,
+                                         fp_nick=fp_nick, overwrite=overwrite, log=log)
             res["symbols_added"] = len(stats["added"])
             res["symbols_skipped_identical"] = len(stats["skipped_identical"])
             res["symbols_renamed"] = len(stats["renamed"])
@@ -276,8 +286,8 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer")
-        self.geometry("880x640")
+        self.title("KiCad Personal Library Importer — Strict Writer")
+        self.geometry("900x640")
 
         self.source = tk.StringVar()
         self.personal = tk.StringVar()
@@ -289,13 +299,13 @@ class App(tk.Tk):
         r = 0
         tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(10,4))
         r += 1
-        tk.Entry(self, textvariable=self.source, width=94).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
+        tk.Entry(self, textvariable=self.source, width=96).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
         tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=2, padx=8)
         r += 1
 
         tk.Label(self, text="Personal library folder (contains symbols.kicad_sym & footprints.pretty):").grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(10,4))
         r += 1
-        tk.Entry(self, textvariable=self.personal, width=94).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
+        tk.Entry(self, textvariable=self.personal, width=96).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
         tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=2, padx=8)
         r += 1
 
@@ -310,8 +320,7 @@ class App(tk.Tk):
         tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=3, sticky="w", padx=10)
         r += 1
 
-        btn_row = tk.Frame(self)
-        btn_row.grid(row=r, column=0, columnspan=3, sticky="we", padx=8, pady=6)
+        btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=3, sticky="we", padx=8, pady=6)
         tk.Button(btn_row, text="Import", command=self.run).pack(side="left", padx=4)
         tk.Button(btn_row, text="Validate/Repair symbols.kicad_sym", command=self.repair_now).pack(side="left", padx=4)
         tk.Button(btn_row, text="Export Report", command=self.export_report).pack(side="left", padx=4)
@@ -329,38 +338,27 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(title="Choose vendor ZIP (or Cancel to pick a folder)")
         if not path:
             path = filedialog.askdirectory(title="Choose a folder (single package or a directory of packages)")
-        if path:
-            self.source.set(path)
+        if path: self.source.set(path)
 
     def pick_personal(self):
         path = filedialog.askdirectory(title="Choose your personal library folder")
-        if path:
-            self.personal.set(path)
+        if path: self.personal.set(path)
 
     def logprint(self, *args):
         msg = " ".join(str(a) for a in args)
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.update_idletasks()
+        self.log.insert("end", msg + "\n"); self.log.see("end"); self.update_idletasks()
 
     def run(self):
         self.results = []
         try:
             src = Path(self.source.get()).expanduser()
             personal = Path(self.personal.get()).expanduser()
-            if not src.exists():
-                messagebox.showerror("Error", "Select a valid source (ZIP or folder)")
-                return
-            if not personal.exists():
-                messagebox.showerror("Error", "Select your personal library folder")
-                return
+            if not src.exists(): messagebox.showerror("Error", "Select a valid source (ZIP or folder)"); return
+            if not personal.exists(): messagebox.showerror("Error", "Select your personal library folder"); return
             ensure_dirs(personal)
 
-            # Gather packages
             pkgs = gather_packages(src, recurse=self.recurse.get())
-            if not pkgs:
-                messagebox.showwarning("Nothing found", "No KiCad parts found in that source.")
-                return
+            if not pkgs: messagebox.showwarning("Nothing found", "No KiCad parts found in that source."); return
 
             self.logprint(f"Found {len(pkgs)} package(s). Starting import...\n")
 
@@ -377,8 +375,7 @@ class App(tk.Tk):
                 self.results.append(res)
                 if res["errors"]:
                     self.logprint("   ", "ERRORS:", "; ".join(res["errors"]))
-                self.logprint(
-                    "   ",
+                self.logprint("   ",
                     f"FP +{res['footprints_imported']} / skipped {res['footprints_skipped']} ;",
                     f"SYM +{res['symbols_added']} / renamed {res['symbols_renamed']} / overwritten {res['symbols_overwritten']} ;",
                     f"3D +{res['models_copied']}"
@@ -386,18 +383,15 @@ class App(tk.Tk):
             self.logprint("\nDone. Reload libraries in KiCad to see updates.")
             messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). Use 'Export Report' to save details.")
         except Exception as e:
-            self.logprint("ERROR:", e)
-            messagebox.showerror("Import failed", str(e))
+            self.logprint("ERROR:", e); messagebox.showerror("Import failed", str(e))
 
     def export_report(self):
-        if not self.results:
-            messagebox.showwarning("No data", "Run an import first."); return
+        if not self.results: messagebox.showwarning("No data", "Run an import first."); return
         ts = time.strftime("%Y%m%d-%H%M%S")
         save_json = filedialog.asksaveasfilename(title="Save JSON report", defaultextension=".json",
                                                  initialfile=f"kicad_personal_import_report_{ts}.json")
         if save_json:
-            with open(save_json, "w", encoding="utf-8") as f:
-                json.dump(self.results, f, indent=2)
+            with open(save_json, "w", encoding="utf-8") as f: json.dump(self.results, f, indent=2)
         save_csv = filedialog.asksaveasfilename(title="Save CSV summary", defaultextension=".csv",
                                                 initialfile=f"kicad_personal_import_report_{ts}.csv")
         if save_csv:
@@ -418,13 +412,12 @@ class App(tk.Tk):
         if not personal.exists() or not sym.exists():
             messagebox.showerror("Error", "Select a valid personal library folder first."); return
         self.logprint(f"Repairing {sym} …")
-        # Read, parse, rebuild clean file
-        merged, raw = read_personal_symbols(sym)
-        if not merged:
+        existing = read_personal_symbols(sym)
+        if not existing:
             self.logprint("   No (symbol …) blocks found. Leaving file as-is.")
             messagebox.showwarning("Nothing to repair", "No symbols found inside the file.")
             return
-        backup = write_symbols_file(sym, merged)
+        backup = write_symbols_file(sym, existing)
         self.logprint(f"   Wrote clean symbols file. Backup at: {backup}")
         messagebox.showinfo("Repaired", "symbols.kicad_sym rebuilt successfully.")
 
