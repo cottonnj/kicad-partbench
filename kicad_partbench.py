@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.2)
+# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.3)
 # - Strict writer: single-root, two-space indents, converts (hide)->(hide yes)
 # - Fixes nested unit names: ParentName_u_c with u,c >= 1; parent prefix enforced
 # - De-duplication modes: Exact, Ignore Properties (default), Pins-only (aggressive)
-# - Ignores nonessential property noise (ids/uuids/at/effects, vendor props) when set
+# - Ignores nonessential property noise when set; option to ignore Footprint for dedupe
 # - Per-symbol verbose logging; Dry run option
-# - **Correct summary counting**: counts TOP-LEVEL symbols only (not nested units)
+# - Accurate summary (top-level symbols only)
+# - **Package pruning**: process only leaf directories; if both ZIP and extracted folder exist, prefer one
 
-import os, re, sys, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
+import os, re, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.2")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.3")\n'
 NONESSENTIAL_PROPS = {
     "Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
     "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
@@ -31,10 +32,88 @@ def ensure_dirs(personal_dir: Path):
 
 def find_files(root: Path, patterns):
     out = []
-    for p in patterns:
-        out += list(root.rglob(p))
+    for pat in patterns:
+        out += list(root.rglob(pat))
     return out
 
+def package_has_content(p: Path):
+    # A package is a directory that has KiCad content *directly inside* (not only in deeper subfolders)
+    # or contains a README + KiCadv6 structure, OR it's a .zip
+    if p.is_file() and p.suffix.lower() == ".zip":
+        return True
+    if not p.is_dir():
+        return False
+    # direct files
+    for pat in ("*.kicad_sym","*.kicad_mod","*.step","*.stp","*.wrl"):
+        if list(p.glob(pat)):
+            return True
+    # common vendor layout subfolder names considered as a single package (KiCADv6)
+    for sub in ("KiCADv6","kicad6","KiCad","Library.pretty","footprints.pretty"):
+        if (p / sub).exists():
+            return True
+    return False
+
+def gather_packages(source: Path, recurse=True):
+    pkgs = []
+    if source.is_file() and source.suffix.lower() == ".zip":
+        pkgs.append(("zip", source))
+        return pkgs
+    if source.is_dir():
+        # include the source only if it itself looks like a package
+        if package_has_content(source):
+            pkgs.append(("dir", source))
+        if recurse:
+            for p in source.rglob("*"):
+                if p.is_file() and p.suffix.lower() == ".zip":
+                    pkgs.append(("zip", p))
+                elif p.is_dir() and package_has_content(p):
+                    pkgs.append(("dir", p))
+    # de-dup exact paths
+    seen, uniq = set(), []
+    for kind, p in pkgs:
+        key = (kind, str(p.resolve()))
+        if key not in seen:
+            seen.add(key); uniq.append((kind, p))
+    return uniq
+
+def prune_packages(pkgs, prefer="folder"):
+    # 1) Drop parent directories that contain any other package beneath them
+    abs_pkgs = [(kind, Path(p).resolve()) for kind, p in pkgs]
+    parents = set()
+    for i, (kind_i, p_i) in enumerate(abs_pkgs):
+        if kind_i != "dir":
+            continue
+        for j, (_k, p_j) in enumerate(abs_pkgs):
+            if i != j and p_j.is_relative_to(p_i):
+                parents.add(p_i); break
+    leaf = [(k,p) for (k,p) in abs_pkgs if not (k == "dir" and p in parents)]
+
+    # 2) If both zip and extracted folder exist with same stem in same parent, keep one
+    grouped = {}
+    for kind, p in leaf:
+        parent = p.parent
+        stem = p.stem if kind == "zip" else p.name
+        grouped.setdefault((str(parent), stem.lower()), []).append((kind, p))
+
+    pruned = []
+    for key, items in grouped.items():
+        if len(items) == 1:
+            pruned.extend(items)
+        else:
+            kinds = {k for k,_ in items}
+            if "zip" in kinds and "dir" in kinds:
+                if prefer == "zip":
+                    chosen = [it for it in items if it[0] == "zip"][0]
+                else:
+                    chosen = [it for it in items if it[0] == "dir"][0]
+                pruned.append(chosen)
+            else:
+                # if multiple dirs with same name (rare) or multiple zips with same stem, pick newest
+                latest = max(items, key=lambda t: t[1].stat().st_mtime if t[1].exists() else 0)
+                pruned.append(latest)
+    return pruned
+
+# -------------------- 3D + Footprints --------------------
 def copy_3d_models(staging: Path, personal: Path, overwrite=False, log=lambda *a: None):
     steps = find_files(staging, ["*.step", "*.stp"])
     wrls  = find_files(staging, ["*.wrl"])
@@ -89,7 +168,6 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
 
 # -------------------- Symbols: parse/sanitize/hash --------------------
 def parse_symbol_blocks(text: str):
-    """Return list of (name, block_text) for top-level (symbol "...") blocks using paren balancing."""
     blocks = []
     i, n = 0, len(text)
     while True:
@@ -112,12 +190,11 @@ def parse_symbol_blocks(text: str):
     return blocks
 
 def fix_units_in_block(parent_name: str, block: str):
-    """Normalize nested unit names: ParentName_u_c with u,c >= 1 and enforced parent prefix."""
     matches = list(re.finditer(r'\(symbol\s+"([^"]+)"', block))
     if not matches or len(matches) == 1:
         return block
     new_block = block
-    for m in reversed(matches[1:]):  # skip parent
+    for m in reversed(matches[1:]):
         child = m.group(1)
         mu = re.match(r'^(.*)_(\d+)_(\d+)$', child)
         if mu:
@@ -209,7 +286,7 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     existing, content_index = read_personal_symbols(personal_sym, mode, ignore_footprint=ignore_footprint_for_dedupe)
     merged = dict(existing)
 
-    # Unique footprint?
+    # unique footprint in this package?
     fp_names = []
     for p in imported_fp_paths:
         try:
@@ -227,7 +304,6 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
         txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
         for name, raw_block in parse_symbol_blocks(txt):
             block = textwrap.dedent(raw_block.strip())
-            # Auto-set footprint if there is exactly one
             if autoset_fp and single_fp:
                 fpfull = f"{fp_nick}:{single_fp}"
                 if re.search(r'\(property\s+"Footprint"\s+"[^"]*"', block):
@@ -263,30 +339,7 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
 
     return stats, merged
 
-# ---- Package gathering ----
-def package_has_content(p: Path):
-    return any(p.rglob("*.kicad_mod")) or any(p.rglob("*.kicad_sym")) or any(p.rglob("*.step")) or any(p.rglob("*.stp")) or any(p.rglob("*.wrl"))
-
-def gather_packages(source: Path, recurse=True):
-    pkgs = []
-    if source.is_file() and source.suffix.lower() == ".zip":
-        return [("zip", source)]
-    if source.is_dir():
-        if package_has_content(source): pkgs.append(("dir", source))
-        if recurse:
-            for p in source.rglob("*"):
-                if p.is_file() and p.suffix.lower() == ".zip":
-                    pkgs.append(("zip", p))
-                elif p.is_dir() and package_has_content(p):
-                    pkgs.append(("dir", p))
-        seen, uniq = set(), []
-        for kind, p in pkgs:
-            key = (kind, str(p.resolve()))
-            if key not in seen:
-                seen.add(key); uniq.append((kind, p))
-        return uniq
-    return []
-
+# ---- unzip/prepare ----
 def unzip_if_needed(path: Path):
     if path.is_dir(): return path, None
     if path.is_file() and path.suffix.lower() == ".zip":
@@ -337,8 +390,8 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.2)")
-        self.geometry("1000x720")
+        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.3)")
+        self.geometry("1020x740")
 
         self.source = tk.StringVar(); self.personal = tk.StringVar()
         self.nick = tk.StringVar(value="Personal_Footprints")
@@ -348,6 +401,7 @@ class App(tk.Tk):
         self.ignore_fp_dedupe = tk.BooleanVar(value=True)
         self.dedupe_mode = tk.StringVar(value="Ignore Properties")
         self.dry_run = tk.BooleanVar(value=False)
+        self.prefer_pkg = tk.StringVar(value="folder")  # or "zip"
 
         r = 0
         tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=4, sticky="w", padx=8, pady=(10,4)); r += 1
@@ -362,6 +416,9 @@ class App(tk.Tk):
         tk.Entry(self, textvariable=self.nick, width=30).grid(row=r, column=1, sticky="w", padx=8, pady=(6,2))
         tk.Label(self, text="De-duplication mode:").grid(row=r, column=2, sticky="e", padx=8)
         ttk.Combobox(self, textvariable=self.dedupe_mode, values=["Exact","Ignore Properties","Pins-only"]).grid(row=r, column=3, sticky="w", padx=8); r += 1
+
+        tk.Label(self, text="If ZIP and folder both exist (same stem):").grid(row=r, column=0, sticky="e", padx=8)
+        ttk.Combobox(self, textvariable=self.prefer_pkg, values=["folder","zip"]).grid(row=r, column=1, sticky="w", padx=8); r += 1
 
         tk.Checkbutton(self, text="Auto-set symbol Footprint when a single footprint is imported", variable=self.autoset).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
         tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
@@ -413,13 +470,16 @@ class App(tk.Tk):
 
             pkgs = gather_packages(src, recurse=self.recurse.get())
             if not pkgs: messagebox.showwarning("Nothing found", "No KiCad parts found in that source."); return
+            pruned = prune_packages(pkgs, prefer=self.prefer_pkg.get())
+            self.logprint(f"Discovered {len(pkgs)} package candidates; using {len(pruned)} after pruning parents and zip/folder duplicates.")
+            pkgs = pruned
 
             initial_count = self._count_top_level(personal / "symbols.kicad_sym")
-            self.logprint(f"Found {len(pkgs)} package(s). Starting import... (initial top-level symbols: {initial_count})\n")
+            self.logprint(f"Starting import… (initial top-level symbols: {initial_count})\n")
 
             for idx, (kind, path) in enumerate(pkgs, 1):
                 self.logprint(f"== [{idx}/{len(pkgs)}] {kind.upper()} :: {path}")
-                def local_log(*a): self.logprint("   ", *a)
+                def local_log(*a): self.logprint('   ', *a)
                 res = process_one_package(
                     kind, path, personal,
                     fp_nick=self.nick.get(),
@@ -447,7 +507,7 @@ class App(tk.Tk):
             sym_path = personal / "symbols.kicad_sym"
             if not self.dry_run.get():
                 final_count = self._count_top_level(sym_path)
-                self.logprint(f"\nSummary: symbols.kicad_sym contains {final_count} top-level symbol(s). (Dry run: {self.dry_run.get()})")
+                self.logprint(f"\nSummary: symbols.kicad_sym contains {final_count} top-level symbol(s).")
                 messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). symbols.kicad_sym contains {final_count} symbol(s).")
             else:
                 adds = sum(1 for r in self.results for (_n,a,_o) in r.get("symbol_names_debug", []) if a in ("ADD","RENAME"))
@@ -475,8 +535,8 @@ class App(tk.Tk):
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
                 for r in self.results:
                     row = {k: r.get(k, "") for k in cols}
-                    if isinstance(row.get("errors"), list): row["errors"] = "; ".join(r["errors"])
-                    if isinstance(row.get("symbol_names_debug"), list): 
+                    if isinstance(row.get("errors"), list): row["errors"] = "; ".join(row["errors"])
+                    if isinstance(row.get("symbol_names_debug"), list):
                         row["symbol_names_debug"] = "; ".join([f"{a}:{b}->{c}" for a,b,c in r["symbol_names_debug"]])
                     w.writerow(row)
         messagebox.showinfo("Saved", "Report saved.")
