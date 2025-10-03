@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer (GUI) — Strict Writer (patched: import textwrap)
-# - Writes strict KiCad-6+ symbols.kicad_sym (single-root, two spaces, '(hide yes)')
-# - Copies footprints + 3D and rewrites model paths to ${PERSONAL_LIB_DIR}
-# - Recursive import from a directory of mixed ZIPs/folders
-# - Validate/Repair button rebuilds symbols.kicad_sym with same sanitizer
-#
-# Patch notes:
-#   * Added `import textwrap` (fixes NameError seen in logs)
-#   * After import, shows a summary of how many symbols are in symbols.kicad_sym
+# KiCad Personal Library Importer — Strict Writer + Smart Dedupe
+# - Writes single-root KiCad-6+ .kicad_sym with two-space indents; converts (hide) -> (hide yes)
+# - Fixes nested unit names: ParentName_u_c with u,c >= 1 and ParentName prefix enforced
+# - De-duplicates symbols by content hash (optionally ignoring Footprint property differences)
+# - Skips content-duplicate symbols even when names differ; logs the canonical kept name
+# - Copies footprints/3D and rewrites model paths
+# - Recursive import from directories of mixed ZIPs/folders
+# - Validate/Repair button rebuilds file with same sanitizer
 
-import os, re, sys, shutil, tempfile, zipfile, time, json, csv, textwrap
+import os, re, sys, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe")\n'
 
+# -------------------- Core helpers --------------------
 def ensure_dirs(personal_dir: Path):
     (personal_dir / "footprints.pretty").mkdir(parents=True, exist_ok=True)
     (personal_dir / "3d" / "step").mkdir(parents=True, exist_ok=True)
@@ -84,7 +84,9 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
             log(f"[FP] ERROR updating 3D for {mod_path}: {e}")
     return updated
 
+# -------------------- Symbols: parse, sanitize, fix units, hash-dedupe --------------------
 def parse_symbol_blocks(text: str):
+    """Return list of (name, block_text) for top-level (symbol "...") blocks using paren balancing."""
     blocks = []
     i, n = 0, len(text)
     while True:
@@ -106,35 +108,64 @@ def parse_symbol_blocks(text: str):
         i = j
     return blocks
 
-def sanitize_block(block: str) -> str:
+def fix_units_in_block(parent_name: str, block: str):
+    """Normalize nested unit names: ParentName_u_c with u,c >= 1 and enforced parent prefix."""
+    matches = list(re.finditer(r'\(symbol\s+"([^"]+)"', block))
+    if not matches or len(matches) == 1:
+        return block
+    new_block = block
+    for m in reversed(matches[1:]):  # skip parent
+        child = m.group(1)
+        mu = re.match(r'^(.*)_(\d+)_(\d+)$', child)
+        if mu:
+            base, u, c = mu.group(1), int(mu.group(2)), int(mu.group(3))
+            new_name = f'{parent_name}_{max(1,u)}_{max(1,c)}'
+        else:
+            new_name = f'{parent_name}_1_1'
+        start, end = m.span(1)
+        new_block = new_block[:start] + new_name + new_block[end:]
+    return new_block
+
+def strip_footprint_prop(block: str):
+    """Remove Footprint property entirely for content hashing."""
+    return re.sub(r'\(\s*property\s+"Footprint"\s+"[^"]*"\s*\(.*?\)\s*\)', '', block, flags=re.DOTALL)
+
+def sanitize_block(parent_name: str, block: str) -> str:
     s = textwrap.dedent(block.strip())
     k = s.find("(symbol ")
     if k > 0: s = s[k:]
     s = re.sub(r'\(hide\)', '(hide yes)', s)
+    s = fix_units_in_block(parent_name, s)
     lines = []
     for ln in s.splitlines():
         lines.append("  " + ln.lstrip().replace("\t", "  "))
     return "\n".join(lines)
 
-def normalize_block_for_compare(block: str) -> str:
-    norm = re.sub(r'\(hide\)', '(hide yes)', block)
-    norm = re.sub(r'\s+', ' ', norm).strip()
-    return norm
+def canonical_content(block: str, ignore_footprint=True) -> str:
+    """Canonical string used for dedupe hashing."""
+    s = re.sub(r'\s+', ' ', block)
+    s = re.sub(r'\(hide\)', '(hide yes)', s)
+    if ignore_footprint:
+        s = strip_footprint_prop(s)
+    return s.strip()
 
-def read_personal_symbols(sym_path: Path):
+def read_personal_symbols(sym_path: Path, ignore_footprint=True):
     if not sym_path.exists():
-        return {}
+        return {}, {}
     raw = sym_path.read_text(encoding="utf-8", errors="ignore")
     merged = {}
+    content_map = {}
     for name, block in parse_symbol_blocks(raw):
-        merged[name] = (sanitize_block(block), normalize_block_for_compare(block))
-    return merged
+        sanitized = sanitize_block(name, block)
+        canon = canonical_content(sanitized, ignore_footprint=ignore_footprint)
+        merged[name] = sanitized
+        content_map[hashlib.sha1(canon.encode("utf-8")).hexdigest()] = name
+    return merged, content_map
 
 def write_symbols_file(sym_path: Path, blocks_by_name: dict):
     out = [HEADER]
     for name in sorted(blocks_by_name.keys(), key=lambda s: s.lower()):
-        block, _norm = blocks_by_name[name]
-        out.append(block.rstrip() + "\n")
+        out.append(blocks_by_name[name].rstrip() + "\n")
     out.append(")\n")
     backup = sym_path.with_suffix(".kicad_sym.bak")
     if sym_path.exists():
@@ -144,10 +175,12 @@ def write_symbols_file(sym_path: Path, blocks_by_name: dict):
     return str(backup)
 
 def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_paths: list,
-                         autoset_fp=True, fp_nick="Personal_Footprints", overwrite=False, log=lambda *a: None):
-    existing = read_personal_symbols(personal_sym)
+                         autoset_fp=True, fp_nick="Personal_Footprints", overwrite=False,
+                         ignore_footprint_for_dedupe=True, log=lambda *a: None):
+    existing, content_index = read_personal_symbols(personal_sym, ignore_footprint=ignore_footprint_for_dedupe)
     merged = dict(existing)
 
+    # Determine single footprint name if unique
     fp_names = []
     for p in imported_fp_paths:
         try:
@@ -159,12 +192,13 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     uniq = {n for n in fp_names if n}
     single_fp = next(iter(uniq)) if len(uniq) == 1 else None
 
-    stats = {"added":[], "skipped_identical":[], "renamed":[], "overwritten":[]}
+    stats = {"added":[], "skipped_identical":[], "renamed":[], "overwritten":[], "skipped_content_dupe":[]}
 
     for symlib in vendor_syms:
         txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
         for name, raw_block in parse_symbol_blocks(txt):
             block = textwrap.dedent(raw_block.strip())
+            # Ensure Footprint property (optional)
             if autoset_fp and single_fp:
                 fpfull = f"{fp_nick}:{single_fp}"
                 if re.search(r'\(property\s+"Footprint"\s+"[^"]*"', block):
@@ -172,31 +206,36 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
                 else:
                     if block.endswith(")"):
                         block = block[:-1] + f'\n    (property "Footprint" "{fpfull}" (at 0 0 0) (effects (font (size 1 1))) (hide yes))\n)\n'
-            sanitized = sanitize_block(block)
-            norm = normalize_block_for_compare(block)
+            sanitized = sanitize_block(name, block)
+            canon = canonical_content(sanitized, ignore_footprint=ignore_footprint_for_dedupe)
+            h = hashlib.sha1(canon.encode("utf-8")).hexdigest()
+
+            # Content-based dedupe across names
+            if h in content_index:
+                kept = content_index[h]
+                stats["skipped_content_dupe"].append((name, kept))
+                log(f"[SYM] Skip duplicate by content: {name} == {kept}")
+                continue
 
             if name in merged:
-                _blk, existing_norm = merged[name]
-                if existing_norm == norm:
-                    stats["skipped_identical"].append(name); log(f"[SYM] Skip duplicate (identical): {name}")
-                    continue
+                # Name exists with different content: overwrite/rename
                 if overwrite:
-                    merged[name] = (sanitized, norm); stats["overwritten"].append(name); log(f"[SYM] Overwrite: {name}")
+                    merged[name] = sanitized; content_index[h] = name; stats["overwritten"].append(name); log(f"[SYM] Overwrite: {name}")
                 else:
                     k, new_name = 1, f"{name}_imp1"
                     while new_name in merged:
                         k += 1; new_name = f"{name}_imp{k}"
                     sanitized = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', sanitized, count=1)
-                    norm = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', norm, count=1)
-                    merged[new_name] = (sanitized, norm)
+                    merged[new_name] = sanitized; content_index[h] = new_name
                     stats["renamed"].append((name, new_name)); stats["added"].append(new_name); log(f"[SYM] Renamed: {new_name}")
             else:
-                merged[name] = (sanitized, norm); stats["added"].append(name)
+                merged[name] = sanitized; content_index[h] = name; stats["added"].append(name)
 
     backup = write_symbols_file(personal_sym, merged)
     log(f"[SYM] Wrote clean symbols file. Backup: {backup}")
     return stats
 
+# ---- Package gathering (zip/folder collections) ----
 def package_has_content(p: Path):
     return any(p.rglob("*.kicad_mod")) or any(p.rglob("*.kicad_sym")) or any(p.rglob("*.step")) or any(p.rglob("*.stp")) or any(p.rglob("*.wrl"))
 
@@ -212,6 +251,7 @@ def gather_packages(source: Path, recurse=True):
                     pkgs.append(("zip", p))
                 elif p.is_dir() and package_has_content(p):
                     pkgs.append(("dir", p))
+        # dedupe
         seen, uniq = set(), []
         for kind, p in pkgs:
             key = (kind, str(p.resolve()))
@@ -229,11 +269,12 @@ def unzip_if_needed(path: Path):
     raise FileNotFoundError("Source is neither a directory nor a .zip")
 
 def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal_Footprints",
-                        autoset_fp=True, overwrite=False, log=lambda *a: None):
+                        autoset_fp=True, overwrite=False, ignore_footprint_for_dedupe=True, log=lambda *a: None):
     res = {
         "package": str(path), "kind": kind,
         "footprints_imported": 0, "footprints_skipped": 0, "footprints_errors": 0,
         "symbols_added": 0, "symbols_skipped_identical": 0, "symbols_renamed": 0, "symbols_overwritten": 0,
+        "symbols_skipped_content_dupe": 0,
         "models_copied": 0, "errors": []
     }
     try:
@@ -254,22 +295,25 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
 
         syms = find_files(staging, ["*.kicad_sym"])
         if syms:
-            stats = merge_symbols_strict(personal / "symbols.kicad_sym", syms, fps_paths, autoset_fp=autoset_fp,
-                                         fp_nick=fp_nick, overwrite=overwrite, log=log)
+            stats = merge_symbols_strict(personal / "symbols.kicad_sym", syms, fps_paths,
+                                         autoset_fp=autoset_fp, fp_nick=fp_nick, overwrite=overwrite,
+                                         ignore_footprint_for_dedupe=ignore_footprint_for_dedupe, log=log)
             res["symbols_added"] = len(stats["added"])
-            res["symbols_skipped_identical"] = len(stats["skipped_identical"])
+            res["symbols_skipped_identical"] = len(stats.get("skipped_identical", []))
             res["symbols_renamed"] = len(stats["renamed"])
             res["symbols_overwritten"] = len(stats["overwritten"])
+            res["symbols_skipped_content_dupe"] = len(stats["skipped_content_dupe"])
         if tmpdir: shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception as e:
         res["errors"].append(str(e))
     return res
 
+# -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — Strict Writer (patched)")
-        self.geometry("900x660")
+        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe")
+        self.geometry("940x680")
 
         self.source = tk.StringVar()
         self.personal = tk.StringVar()
@@ -277,17 +321,18 @@ class App(tk.Tk):
         self.autoset = tk.BooleanVar(value=True)
         self.overwrite = tk.BooleanVar(value=False)
         self.recurse = tk.BooleanVar(value=True)
+        self.ignore_fp_dedupe = tk.BooleanVar(value=True)
 
         r = 0
         tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(10,4))
         r += 1
-        tk.Entry(self, textvariable=self.source, width=96).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
+        tk.Entry(self, textvariable=self.source, width=100).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
         tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=2, padx=8)
         r += 1
 
         tk.Label(self, text="Personal library folder (contains symbols.kicad_sym & footprints.pretty):").grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(10,4))
         r += 1
-        tk.Entry(self, textvariable=self.personal, width=96).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
+        tk.Entry(self, textvariable=self.personal, width=100).grid(row=r, column=0, columnspan=2, sticky="we", padx=8)
         tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=2, padx=8)
         r += 1
 
@@ -300,6 +345,8 @@ class App(tk.Tk):
         tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=3, sticky="w", padx=10)
         r += 1
         tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=3, sticky="w", padx=10)
+        r += 1
+        tk.Checkbutton(self, text="Ignore Footprint when de-duplicating (recommended)", variable=self.ignore_fp_dedupe).grid(row=r, column=0, columnspan=3, sticky="w", padx=10)
         r += 1
 
         btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=3, sticky="we", padx=8, pady=6)
@@ -319,7 +366,7 @@ class App(tk.Tk):
     def pick_source(self):
         path = filedialog.askopenfilename(title="Choose vendor ZIP (or Cancel to pick a folder)")
         if not path:
-            path = filedialog.askdirectory(title="Choose a folder (single package or a directory of packages)")
+            path = filedialog.askdirectory(title="Choose a folder (single package or aDirectory of packages)")
         if path: self.source.set(path)
 
     def pick_personal(self):
@@ -352,6 +399,7 @@ class App(tk.Tk):
                     fp_nick=self.nick.get(),
                     autoset_fp=self.autoset.get(),
                     overwrite=self.overwrite.get(),
+                    ignore_footprint_for_dedupe=self.ignore_fp_dedupe.get(),
                     log=local_log
                 )
                 self.results.append(res)
@@ -359,7 +407,7 @@ class App(tk.Tk):
                     self.logprint("   ", "ERRORS:", "; ".join(res["errors"]))
                 self.logprint("   ",
                     f"FP +{res['footprints_imported']} / skipped {res['footprints_skipped']} ;",
-                    f"SYM +{res['symbols_added']} / renamed {res['symbols_renamed']} / overwritten {res['symbols_overwritten']} ;",
+                    f"SYM +{res['symbols_added']} / renamed {res['symbols_renamed']} / overwritten {res['symbols_overwritten']} / content-dupes {res['symbols_skipped_content_dupe']} ;",
                     f"3D +{res['models_copied']}"
                 )
 
@@ -390,7 +438,7 @@ class App(tk.Tk):
         if save_csv:
             cols = ["package","kind","footprints_imported","footprints_skipped","footprints_errors",
                     "symbols_added","symbols_renamed","symbols_overwritten","symbols_skipped_identical",
-                    "models_copied","errors"]
+                    "symbols_skipped_content_dupe","models_copied","errors"]
             with open(save_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
                 for r in self.results:
@@ -405,12 +453,15 @@ class App(tk.Tk):
         if not personal.exists() or not sym.exists():
             messagebox.showerror("Error", "Select a valid personal library folder first."); return
         self.logprint(f"Repairing {sym} …")
-        existing = read_personal_symbols(sym)
-        if not existing:
+        raw = sym.read_text(encoding="utf-8", errors="ignore")
+        merged = {}
+        for name, block in parse_symbol_blocks(raw):
+            merged[name] = sanitize_block(name, block)
+        if not merged:
             self.logprint("   No (symbol …) blocks found. Leaving file as-is.")
             messagebox.showwarning("Nothing to repair", "No symbols found inside the file.")
             return
-        backup = write_symbols_file(sym, existing)
+        backup = write_symbols_file(sym, merged)
         self.logprint(f"   Wrote clean symbols file. Backup at: {backup}")
         messagebox.showinfo("Repaired", "symbols.kicad_sym rebuilt successfully.")
 
