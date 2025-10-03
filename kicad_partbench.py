@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer (GUI) — Strict Writer
-# - Imports mixed ZIPs/folders of KiCad parts into a central personal library
-# - Copies footprints/3D, fixes 3D model paths to ${PERSONAL_LIB_DIR}
-# - Merges symbols and writes a STRICT, sanitized symbols.kicad_sym:
-#     * Single-root header
-#     * Two-space indent, no tabs
-#     * Converts "(hide)" -> "(hide yes)"
-#     * Stable alphabetical order
-#     * .bak backup before writing
-# - Validate/Repair button rebuilds the file with the same sanitizer
+# KiCad Personal Library Importer (GUI) — Strict Writer (patched: import textwrap)
+# - Writes strict KiCad-6+ symbols.kicad_sym (single-root, two spaces, '(hide yes)')
+# - Copies footprints + 3D and rewrites model paths to ${PERSONAL_LIB_DIR}
+# - Recursive import from a directory of mixed ZIPs/folders
+# - Validate/Repair button rebuilds symbols.kicad_sym with same sanitizer
 #
-# Tested with KiCad 6/7/8/9 formats.
+# Patch notes:
+#   * Added `import textwrap` (fixes NameError seen in logs)
+#   * After import, shows a summary of how many symbols are in symbols.kicad_sym
 
-import os, re, sys, shutil, tempfile, zipfile, time, json, csv
+import os, re, sys, shutil, tempfile, zipfile, time, json, csv, textwrap
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -20,7 +17,6 @@ from tkinter.scrolledtext import ScrolledText
 
 HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict")\n'
 
-# -------------------- Core helpers --------------------
 def ensure_dirs(personal_dir: Path):
     (personal_dir / "footprints.pretty").mkdir(parents=True, exist_ok=True)
     (personal_dir / "3d" / "step").mkdir(parents=True, exist_ok=True)
@@ -88,9 +84,7 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
             log(f"[FP] ERROR updating 3D for {mod_path}: {e}")
     return updated
 
-# -------------------- Symbols (strict sanitizer) --------------------
 def parse_symbol_blocks(text: str):
-    """Return list of (name, block_text) for top-level (symbol "...") blocks using paren balancing."""
     blocks = []
     i, n = 0, len(text)
     while True:
@@ -113,19 +107,16 @@ def parse_symbol_blocks(text: str):
     return blocks
 
 def sanitize_block(block: str) -> str:
-    """Strict KiCad-6+ compatible cleanup. No tabs; two-space indent; '(hide)' -> '(hide yes)'."""
     s = textwrap.dedent(block.strip())
     k = s.find("(symbol ")
     if k > 0: s = s[k:]
     s = re.sub(r'\(hide\)', '(hide yes)', s)
-    # Remove tabs and reindent with two spaces
     lines = []
     for ln in s.splitlines():
         lines.append("  " + ln.lstrip().replace("\t", "  "))
     return "\n".join(lines)
 
 def normalize_block_for_compare(block: str) -> str:
-    """Normalization used for duplicate detection (ignores whitespace and bare/yes hide)."""
     norm = re.sub(r'\(hide\)', '(hide yes)', block)
     norm = re.sub(r'\s+', ' ', norm).strip()
     return norm
@@ -140,7 +131,6 @@ def read_personal_symbols(sym_path: Path):
     return merged
 
 def write_symbols_file(sym_path: Path, blocks_by_name: dict):
-    """Rewrite as a clean, single-root file. Backup .bak first."""
     out = [HEADER]
     for name in sorted(blocks_by_name.keys(), key=lambda s: s.lower()):
         block, _norm = blocks_by_name[name]
@@ -158,7 +148,6 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     existing = read_personal_symbols(personal_sym)
     merged = dict(existing)
 
-    # Single footprint name?
     fp_names = []
     for p in imported_fp_paths:
         try:
@@ -175,7 +164,6 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     for symlib in vendor_syms:
         txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
         for name, raw_block in parse_symbol_blocks(txt):
-            # Ensure Footprint property
             block = textwrap.dedent(raw_block.strip())
             if autoset_fp and single_fp:
                 fpfull = f"{fp_nick}:{single_fp}"
@@ -184,7 +172,6 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
                 else:
                     if block.endswith(")"):
                         block = block[:-1] + f'\n    (property "Footprint" "{fpfull}" (at 0 0 0) (effects (font (size 1 1))) (hide yes))\n)\n'
-            # Sanitize for write + normalize for compare
             sanitized = sanitize_block(block)
             norm = normalize_block_for_compare(block)
 
@@ -199,12 +186,10 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
                     k, new_name = 1, f"{name}_imp1"
                     while new_name in merged:
                         k += 1; new_name = f"{name}_imp{k}"
-                    # rename inside symbol
                     sanitized = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', sanitized, count=1)
                     norm = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', norm, count=1)
                     merged[new_name] = (sanitized, norm)
-                    stats["renamed"].append((name, new_name)); stats["added"].append(new_name)
-                    log(f"[SYM] Renamed to avoid conflict: {new_name}")
+                    stats["renamed"].append((name, new_name)); stats["added"].append(new_name); log(f"[SYM] Renamed: {new_name}")
             else:
                 merged[name] = (sanitized, norm); stats["added"].append(name)
 
@@ -212,7 +197,6 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     log(f"[SYM] Wrote clean symbols file. Backup: {backup}")
     return stats
 
-# ---- Package gathering (zip/folder collections) ----
 def package_has_content(p: Path):
     return any(p.rglob("*.kicad_mod")) or any(p.rglob("*.kicad_sym")) or any(p.rglob("*.step")) or any(p.rglob("*.stp")) or any(p.rglob("*.wrl"))
 
@@ -228,7 +212,6 @@ def gather_packages(source: Path, recurse=True):
                     pkgs.append(("zip", p))
                 elif p.is_dir() and package_has_content(p):
                     pkgs.append(("dir", p))
-        # dedupe
         seen, uniq = set(), []
         for kind, p in pkgs:
             key = (kind, str(p.resolve()))
@@ -282,12 +265,11 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
         res["errors"].append(str(e))
     return res
 
-# -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — Strict Writer")
-        self.geometry("900x640")
+        self.title("KiCad Personal Library Importer — Strict Writer (patched)")
+        self.geometry("900x660")
 
         self.source = tk.StringVar()
         self.personal = tk.StringVar()
@@ -327,7 +309,7 @@ class App(tk.Tk):
         tk.Button(btn_row, text="Quit", command=self.destroy).pack(side="right", padx=4)
         r += 1
 
-        self.log = ScrolledText(self, wrap="word", height=22)
+        self.log = ScrolledText(self, wrap="word", height=24)
         self.log.grid(row=r, column=0, columnspan=3, sticky="nsew", padx=8, pady=8)
         self.grid_rowconfigure(r, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -380,8 +362,19 @@ class App(tk.Tk):
                     f"SYM +{res['symbols_added']} / renamed {res['symbols_renamed']} / overwritten {res['symbols_overwritten']} ;",
                     f"3D +{res['models_copied']}"
                 )
-            self.logprint("\nDone. Reload libraries in KiCad to see updates.")
-            messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). Use 'Export Report' to save details.")
+
+            # Summary: count symbols in resulting file
+            sym_path = personal / "symbols.kicad_sym"
+            count = 0
+            if sym_path.exists():
+                try:
+                    raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+                    count = raw.count("(symbol ")
+                except Exception as e:
+                    self.logprint("WARN: could not read symbols.kicad_sym to summarize:", e)
+            self.logprint(f"\nSummary: symbols.kicad_sym contains {count} symbol(s).")
+            self.logprint("Done. Reload libraries in KiCad to see updates.")
+            messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). symbols.kicad_sym contains {count} symbol(s).")
         except Exception as e:
             self.logprint("ERROR:", e); messagebox.showerror("Import failed", str(e))
 
