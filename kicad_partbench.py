@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.3)
+# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.4)
 # - Strict writer: single-root, two-space indents, converts (hide)->(hide yes)
 # - Fixes nested unit names: ParentName_u_c with u,c >= 1; parent prefix enforced
 # - De-duplication modes: Exact, Ignore Properties (default), Pins-only (aggressive)
 # - Ignores nonessential property noise when set; option to ignore Footprint for dedupe
 # - Per-symbol verbose logging; Dry run option
 # - Accurate summary (top-level symbols only)
-# - **Package pruning**: process only leaf directories; if both ZIP and extracted folder exist, prefer one
+# - Package pruning: process only leaf directories; if both ZIP and extracted folder exist, prefer one
+# - NEW: Remembers last used Source/Personal directories (prefs at ~/.kicad_personal_importer.json)
+# - NEW: "View Library Parts" — list symbols with footprint + 3D model status
 
 import os, re, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
 from pathlib import Path
@@ -14,12 +16,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.3")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.4")\n'
 NONESSENTIAL_PROPS = {
     "Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
     "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
     "Link","URL","Alt","Notes"
 }
+PREFS_FILE = Path.home() / ".kicad_personal_importer.json"
 
 # -------------------- Filesystem helpers --------------------
 def ensure_dirs(personal_dir: Path):
@@ -37,17 +40,13 @@ def find_files(root: Path, patterns):
     return out
 
 def package_has_content(p: Path):
-    # A package is a directory that has KiCad content *directly inside* (not only in deeper subfolders)
-    # or contains a README + KiCadv6 structure, OR it's a .zip
     if p.is_file() and p.suffix.lower() == ".zip":
         return True
     if not p.is_dir():
         return False
-    # direct files
     for pat in ("*.kicad_sym","*.kicad_mod","*.step","*.stp","*.wrl"):
         if list(p.glob(pat)):
             return True
-    # common vendor layout subfolder names considered as a single package (KiCADv6)
     for sub in ("KiCADv6","kicad6","KiCad","Library.pretty","footprints.pretty"):
         if (p / sub).exists():
             return True
@@ -59,7 +58,6 @@ def gather_packages(source: Path, recurse=True):
         pkgs.append(("zip", source))
         return pkgs
     if source.is_dir():
-        # include the source only if it itself looks like a package
         if package_has_content(source):
             pkgs.append(("dir", source))
         if recurse:
@@ -68,7 +66,6 @@ def gather_packages(source: Path, recurse=True):
                     pkgs.append(("zip", p))
                 elif p.is_dir() and package_has_content(p):
                     pkgs.append(("dir", p))
-    # de-dup exact paths
     seen, uniq = set(), []
     for kind, p in pkgs:
         key = (kind, str(p.resolve()))
@@ -84,7 +81,7 @@ def prune_packages(pkgs, prefer="folder"):
         if kind_i != "dir":
             continue
         for j, (_k, p_j) in enumerate(abs_pkgs):
-            if i != j and p_j.is_relative_to(p_i):
+            if i != j and str(p_j).startswith(str(p_i) + os.sep):
                 parents.add(p_i); break
     leaf = [(k,p) for (k,p) in abs_pkgs if not (k == "dir" and p in parents)]
 
@@ -108,7 +105,6 @@ def prune_packages(pkgs, prefer="folder"):
                     chosen = [it for it in items if it[0] == "dir"][0]
                 pruned.append(chosen)
             else:
-                # if multiple dirs with same name (rare) or multiple zips with same stem, pick newest
                 latest = max(items, key=lambda t: t[1].stat().st_mtime if t[1].exists() else 0)
                 pruned.append(latest)
     return pruned
@@ -390,8 +386,8 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.3)")
-        self.geometry("1020x740")
+        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.4)")
+        self.geometry("1100x760")
 
         self.source = tk.StringVar(); self.personal = tk.StringVar()
         self.nick = tk.StringVar(value="Personal_Footprints")
@@ -403,50 +399,97 @@ class App(tk.Tk):
         self.dry_run = tk.BooleanVar(value=False)
         self.prefer_pkg = tk.StringVar(value="folder")  # or "zip"
 
-        r = 0
-        tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=4, sticky="w", padx=8, pady=(10,4)); r += 1
-        tk.Entry(self, textvariable=self.source, width=110).grid(row=r, column=0, columnspan=3, sticky="we", padx=8)
-        tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=3, padx=8); r += 1
+        self.prefs = self.load_prefs()
+        if self.prefs.get("last_source_dir"): self.source.set(self.prefs["last_source_dir"])
+        if self.prefs.get("last_personal_dir"): self.personal.set(self.prefs["last_personal_dir"])
 
-        tk.Label(self, text="Personal library folder (contains symbols.kicad_sym & footprints.pretty):").grid(row=r, column=0, columnspan=4, sticky="w", padx=8, pady=(10,4)); r += 1
-        tk.Entry(self, textvariable=self.personal, width=110).grid(row=r, column=0, columnspan=3, sticky="we", padx=8)
-        tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=3, padx=8); r += 1
+        r = 0
+        tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=5, sticky="w", padx=8, pady=(10,4)); r += 1
+        tk.Entry(self, textvariable=self.source, width=120).grid(row=r, column=0, columnspan=4, sticky="we", padx=8)
+        tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=4, padx=8); r += 1
+
+        tk.Label(self, text="Personal library folder (contains symbols.kicad_sym & footprints.pretty):").grid(row=r, column=0, columnspan=5, sticky="w", padx=8, pady=(10,4)); r += 1
+        tk.Entry(self, textvariable=self.personal, width=120).grid(row=r, column=0, columnspan=4, sticky="we", padx=8)
+        tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=4, padx=8); r += 1
 
         tk.Label(self, text="Footprint nickname:").grid(row=r, column=0, sticky="e", padx=8, pady=(6,2))
         tk.Entry(self, textvariable=self.nick, width=30).grid(row=r, column=1, sticky="w", padx=8, pady=(6,2))
         tk.Label(self, text="De-duplication mode:").grid(row=r, column=2, sticky="e", padx=8)
-        ttk.Combobox(self, textvariable=self.dedupe_mode, values=["Exact","Ignore Properties","Pins-only"]).grid(row=r, column=3, sticky="w", padx=8); r += 1
+        ttk.Combobox(self, textvariable=self.dedupe_mode, values=["Exact","Ignore Properties","Pins-only"]).grid(row=r, column=3, sticky="w", padx=8)
+        tk.Label(self, text="If ZIP and folder both exist (same stem):").grid(row=r, column=4, sticky="e", padx=8)
+        ttk.Combobox(self, textvariable=self.prefer_pkg, values=["folder","zip"]).grid(row=r, column=5, sticky="w", padx=8); r += 1
 
-        tk.Label(self, text="If ZIP and folder both exist (same stem):").grid(row=r, column=0, sticky="e", padx=8)
-        ttk.Combobox(self, textvariable=self.prefer_pkg, values=["folder","zip"]).grid(row=r, column=1, sticky="w", padx=8); r += 1
+        tk.Checkbutton(self, text="Auto-set symbol Footprint when a single footprint is imported", variable=self.autoset).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Ignore Footprint when de-duplicating (recommended)", variable=self.ignore_fp_dedupe).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Dry run (don’t write file; just show what would happen)", variable=self.dry_run).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
 
-        tk.Checkbutton(self, text="Auto-set symbol Footprint when a single footprint is imported", variable=self.autoset).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Ignore Footprint when de-duplicating (recommended)", variable=self.ignore_fp_dedupe).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Dry run (don’t write file; just show what would happen)", variable=self.dry_run).grid(row=r, column=0, columnspan=4, sticky="w", padx=10); r += 1
-
-        btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=4, sticky="we", padx=8, pady=6)
+        btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=6, sticky="we", padx=8, pady=6)
         tk.Button(btn_row, text="Import", command=self.run).pack(side="left", padx=4)
         tk.Button(btn_row, text="Validate/Repair symbols.kicad_sym", command=self.repair_now).pack(side="left", padx=4)
+        tk.Button(btn_row, text="View Library Parts", command=self.view_library_parts).pack(side="left", padx=4)
         tk.Button(btn_row, text="Export Report", command=self.export_report).pack(side="left", padx=4)
         tk.Button(btn_row, text="Quit", command=self.destroy).pack(side="right", padx=4); r += 1
 
         self.log = ScrolledText(self, wrap="word", height=28)
-        self.log.grid(row=r, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
+        self.log.grid(row=r, column=0, columnspan=6, sticky="nsew", padx=8, pady=8)
         self.grid_rowconfigure(r, weight=1); self.grid_columnconfigure(1, weight=1)
 
         self.results = []
 
+    # ---------- Preferences ----------
+    def load_prefs(self):
+        try:
+            if PREFS_FILE.exists():
+                return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def save_prefs(self):
+        try:
+            data = {
+                "last_source_dir": self.source.get(),
+                "last_personal_dir": self.personal.get()
+            }
+            PREFS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _initialdir_for(self, path_str: str):
+        try:
+            if path_str:
+                p = Path(path_str).expanduser()
+                if p.exists():
+                    if p.is_file(): return str(p.parent)
+                    if p.is_dir(): return str(p)
+            # fallback to prefs
+            if self.prefs.get("last_source_dir") and Path(self.prefs["last_source_dir"]).exists():
+                return self.prefs["last_source_dir"]
+        except Exception:
+            pass
+        return str(Path.home())
+
     def pick_source(self):
-        path = filedialog.askopenfilename(title="Choose vendor ZIP (or Cancel to pick a folder)")
+        initdir = self._initialdir_for(self.source.get())
+        path = filedialog.askopenfilename(title="Choose vendor ZIP (or Cancel to pick a folder)", initialdir=initdir)
         if not path:
-            path = filedialog.askdirectory(title="Choose a folder (single package or a directory of packages)")
-        if path: self.source.set(path)
+            path = filedialog.askdirectory(title="Choose a folder (single package or a directory of packages)", initialdir=initdir)
+        if path:
+            self.source.set(path)
+            # store directory form
+            dir_path = str(Path(path).parent if Path(path).is_file() else Path(path))
+            self.prefs["last_source_dir"] = dir_path
+            self.save_prefs()
 
     def pick_personal(self):
-        path = filedialog.askdirectory(title="Choose your personal library folder")
-        if path: self.personal.set(path)
+        initdir = self._initialdir_for(self.personal.get())
+        path = filedialog.askdirectory(title="Choose your personal library folder", initialdir=initdir)
+        if path:
+            self.personal.set(path)
+            self.prefs["last_personal_dir"] = path
+            self.save_prefs()
 
     def logprint(self, *args):
         msg = " ".join(str(a) for a in args)
@@ -459,6 +502,7 @@ class App(tk.Tk):
             return 0
         return len(parse_symbol_blocks(raw))
 
+    # ---------- Main actions ----------
     def run(self):
         self.results = []
         try:
@@ -467,6 +511,7 @@ class App(tk.Tk):
             if not src.exists(): messagebox.showerror("Error", "Select a valid source (ZIP or folder)"); return
             if not personal.exists(): messagebox.showerror("Error", "Select your personal library folder"); return
             ensure_dirs(personal)
+            self.save_prefs()
 
             pkgs = gather_packages(src, recurse=self.recurse.get())
             if not pkgs: messagebox.showwarning("Nothing found", "No KiCad parts found in that source."); return
@@ -522,11 +567,13 @@ class App(tk.Tk):
         if not self.results: messagebox.showwarning("No data", "Run an import first."); return
         ts = time.strftime("%Y%m%d-%H%M%S")
         save_json = filedialog.asksaveasfilename(title="Save JSON report", defaultextension=".json",
-                                                 initialfile=f"kicad_personal_import_report_{ts}.json")
+                                                 initialfile=f"kicad_personal_import_report_{ts}.json",
+                                                 initialdir=self._initialdir_for(self.source.get()))
         if save_json:
             with open(save_json, "w", encoding="utf-8") as f: json.dump(self.results, f, indent=2)
         save_csv = filedialog.asksaveasfilename(title="Save CSV summary", defaultextension=".csv",
-                                                initialfile=f"kicad_personal_import_report_{ts}.csv")
+                                                initialfile=f"kicad_personal_import_report_{ts}.csv",
+                                                initialdir=self._initialdir_for(self.source.get()))
         if save_csv:
             cols = ["package","kind","footprints_imported","footprints_skipped","footprints_errors",
                     "symbols_added","symbols_renamed","symbols_overwritten","symbols_skipped_identical",
@@ -558,6 +605,82 @@ class App(tk.Tk):
         backup = write_symbols_file(sym, merged)
         self.logprint(f"   Wrote clean symbols file. Backup at: {backup}")
         messagebox.showinfo("Repaired", "symbols.kicad_sym rebuilt successfully.")
+
+    # ---------- Library listing ----------
+    def view_library_parts(self):
+        personal = Path(self.personal.get()).expanduser()
+        sym_path = personal / "symbols.kicad_sym"
+        fp_dir = personal / "footprints.pretty"
+        if not sym_path.exists():
+            messagebox.showerror("Error", f"No symbols.kicad_sym at: {sym_path}"); return
+        raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+        blocs = parse_symbol_blocks(raw)
+        if not blocs:
+            messagebox.showwarning("Empty", "No symbols found in your library."); return
+
+        def footprint_of(block: str):
+            m = re.search(r'\(\s*property\s+"Footprint"\s+"([^"]+)"', block)
+            return m.group(1) if m else None
+
+        def footprint_file_exists(fp_prop: str):
+            if not fp_prop: return (None, False)
+            # Extract module name after colon if present
+            mod = fp_prop.split(":")[-1].strip()
+            if not mod: return (mod, False)
+            fpath = fp_dir / f"{mod}.kicad_mod"
+            return (mod, fpath.exists())
+
+        def models_status(mod_name: str):
+            if not mod_name: return ("None", 0, 0)
+            fpath = fp_dir / f"{mod_name}.kicad_mod"
+            if not fpath.exists(): return ("Missing footprint", 0, 0)
+            txt = fpath.read_text(encoding="utf-8", errors="ignore")
+            models = re.findall(r'\(model\s+"([^"]+)"', txt)
+            if not models: return ("None", 0, 0)
+            total = len(models); found = 0
+            for mpath in models:
+                base = os.path.basename(mpath.replace("\\","/"))
+                if (personal / "3d" / "step" / base).exists() or (personal / "3d" / "wrl" / base).exists():
+                    found += 1
+            status = f"Found {found}/{total}" if total else "None"
+            return (status, found, total)
+
+        lines = []
+        ok_fp = missing_fp = none_fp = 0
+        ok_3d = some_3d = none_3d = 0
+
+        for name, block in sorted(blocs, key=lambda t: t[0].lower()):
+            fp_prop = footprint_of(block)
+            mod_name, has_fp = footprint_file_exists(fp_prop)
+            if fp_prop is None:
+                fp_status = "No footprint prop"
+                none_fp += 1
+            elif has_fp:
+                fp_status = f"Footprint OK ({mod_name})"
+                ok_fp += 1
+            else:
+                fp_status = f"Footprint MISSING ({mod_name})"
+                missing_fp += 1
+            mstat, found, total = models_status(mod_name if has_fp else None)
+            if mstat.startswith("Found"):
+                if found == total:
+                    ok_3d += 1
+                else:
+                    some_3d += 1
+            elif mstat == "None":
+                none_3d += 1
+            lines.append(f"{name} — {fp_status} — 3D: {mstat}")
+
+        # Show window
+        win = tk.Toplevel(self)
+        win.title("Library Parts Overview")
+        win.geometry("900x600")
+        summary = f"Symbols: {len(blocs)} | Footprint: OK {ok_fp}, Missing {missing_fp}, No-prop {none_fp} | 3D: All-found {ok_3d}, Partial {some_3d}, None {none_3d}"
+        tk.Label(win, text=summary).pack(anchor="w", padx=8, pady=6)
+        txt = ScrolledText(win, wrap="word")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("end", "\n".join(lines))
+        txt.configure(state="disabled")
 
 def main():
     app = App()
