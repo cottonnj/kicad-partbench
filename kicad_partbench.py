@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.1 with diagnostics)
-# - Adds: "Dry run (don't write)" toggle and per-symbol verbose logging
-# - Logs every symbol name discovered per package, and whether it was ADDED, SKIPPED (content-dupe), RENAMED, or OVERWRITTEN
+# KiCad Personal Library Importer — Strict + Smart Dedupe (v3.2)
+# - Strict writer: single-root, two-space indents, converts (hide)->(hide yes)
+# - Fixes nested unit names: ParentName_u_c with u,c >= 1; parent prefix enforced
+# - De-duplication modes: Exact, Ignore Properties (default), Pins-only (aggressive)
+# - Ignores nonessential property noise (ids/uuids/at/effects, vendor props) when set
+# - Per-symbol verbose logging; Dry run option
+# - **Correct summary counting**: counts TOP-LEVEL symbols only (not nested units)
 
 import os, re, sys, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
 from pathlib import Path
@@ -9,13 +13,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.1")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "gui-strict-dedupe-v3.2")\n'
 NONESSENTIAL_PROPS = {
     "Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
     "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
     "Link","URL","Alt","Notes"
 }
 
+# -------------------- Filesystem helpers --------------------
 def ensure_dirs(personal_dir: Path):
     (personal_dir / "footprints.pretty").mkdir(parents=True, exist_ok=True)
     (personal_dir / "3d" / "step").mkdir(parents=True, exist_ok=True)
@@ -82,7 +87,9 @@ def update_footprints_3d(personal: Path, model_map: dict, only_paths=None, log=l
             log(f"[FP] ERROR updating 3D for {mod_path}: {e}")
     return updated
 
+# -------------------- Symbols: parse/sanitize/hash --------------------
 def parse_symbol_blocks(text: str):
+    """Return list of (name, block_text) for top-level (symbol "...") blocks using paren balancing."""
     blocks = []
     i, n = 0, len(text)
     while True:
@@ -105,10 +112,12 @@ def parse_symbol_blocks(text: str):
     return blocks
 
 def fix_units_in_block(parent_name: str, block: str):
+    """Normalize nested unit names: ParentName_u_c with u,c >= 1 and enforced parent prefix."""
     matches = list(re.finditer(r'\(symbol\s+"([^"]+)"', block))
-    if not matches or len(matches) == 1: return block
+    if not matches or len(matches) == 1:
+        return block
     new_block = block
-    for m in reversed(matches[1:]):
+    for m in reversed(matches[1:]):  # skip parent
         child = m.group(1)
         mu = re.match(r'^(.*)_(\d+)_(\d+)$', child)
         if mu:
@@ -140,8 +149,6 @@ def strip_prop_ids(block: str):
     s = re.sub(r'\(effects\s+\(.*?\)\)', '', s, flags=re.DOTALL)
     return s
 
-NONESSENTIAL_PROPS = set(NONESSENTIAL_PROPS)
-
 def drop_nonessential_props(block: str):
     def repl(m):
         name = m.group(1)
@@ -156,7 +163,6 @@ def pins_signature(block: str):
         ptype, num, name = m.group(1), m.group(2), m.group(3)
         pins.append((ptype, num, name))
     pins.sort()
-    import json
     return json.dumps(pins, separators=(',',':'))
 
 def canonical_content(block: str, mode: str, ignore_footprint=True) -> str:
@@ -203,6 +209,7 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
     existing, content_index = read_personal_symbols(personal_sym, mode, ignore_footprint=ignore_footprint_for_dedupe)
     merged = dict(existing)
 
+    # Unique footprint?
     fp_names = []
     for p in imported_fp_paths:
         try:
@@ -220,6 +227,7 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
         txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
         for name, raw_block in parse_symbol_blocks(txt):
             block = textwrap.dedent(raw_block.strip())
+            # Auto-set footprint if there is exactly one
             if autoset_fp and single_fp:
                 fpfull = f"{fp_nick}:{single_fp}"
                 if re.search(r'\(property\s+"Footprint"\s+"[^"]*"', block):
@@ -253,9 +261,9 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
             else:
                 merged[name] = sanitized; content_index[h] = name; stats["added"].append(name); stats["debug_symbols"].append((name, "ADD", name))
 
-    # Only write if not dry-run; handled by caller
     return stats, merged
 
+# ---- Package gathering ----
 def package_has_content(p: Path):
     return any(p.rglob("*.kicad_mod")) or any(p.rglob("*.kicad_sym")) or any(p.rglob("*.step")) or any(p.rglob("*.stp")) or any(p.rglob("*.wrl"))
 
@@ -307,7 +315,6 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
         fps_paths, imported, skipped, fp_errs = import_footprints(staging, personal, overwrite=overwrite, log=log)
         res["footprints_imported"] = len(imported); res["footprints_skipped"] = len(skipped); res["footprints_errors"] = len(fp_errs)
 
-        # symbols
         syms = find_files(staging, ["*.kicad_sym"])
         if syms:
             stats, merged = merge_symbols_strict(personal / "symbols.kicad_sym", syms, fps_paths,
@@ -320,18 +327,17 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_nick="Personal
             res["symbols_skipped_content_dupe"] = len(stats["skipped_content_dupe"])
             res["symbol_names_debug"] = stats["debug_symbols"]
             if not dry_run:
-                # write merged now
-                from collections import OrderedDict
-                backup = write_symbols_file(personal / "symbols.kicad_sym", merged)
+                write_symbols_file(personal / "symbols.kicad_sym", merged)
         if tmpdir: shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception as e:
         res["errors"].append(str(e))
     return res
 
+# -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.1)")
+        self.title("KiCad Personal Library Importer — Strict + Smart Dedupe (v3.2)")
         self.geometry("1000x720")
 
         self.source = tk.StringVar(); self.personal = tk.StringVar()
@@ -389,6 +395,13 @@ class App(tk.Tk):
         msg = " ".join(str(a) for a in args)
         self.log.insert("end", msg + "\n"); self.log.see("end"); self.update_idletasks()
 
+    def _count_top_level(self, sym_path: Path):
+        try:
+            raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return 0
+        return len(parse_symbol_blocks(raw))
+
     def run(self):
         self.results = []
         try:
@@ -401,7 +414,8 @@ class App(tk.Tk):
             pkgs = gather_packages(src, recurse=self.recurse.get())
             if not pkgs: messagebox.showwarning("Nothing found", "No KiCad parts found in that source."); return
 
-            self.logprint(f"Found {len(pkgs)} package(s). Starting import...\n")
+            initial_count = self._count_top_level(personal / "symbols.kicad_sym")
+            self.logprint(f"Found {len(pkgs)} package(s). Starting import... (initial top-level symbols: {initial_count})\n")
 
             for idx, (kind, path) in enumerate(pkgs, 1):
                 self.logprint(f"== [{idx}/{len(pkgs)}] {kind.upper()} :: {path}")
@@ -417,12 +431,11 @@ class App(tk.Tk):
                     log=local_log
                 )
                 self.results.append(res)
-                # Verbose per-symbol outcome
                 for name, action, other in res.get("symbol_names_debug", []):
-                    if action == "ADD":      self.logprint("   [SYM] ADD   ", name)
-                    elif action == "SKIP_DUP": self.logprint("   [SYM] SKIP  ", name, "==", other)
-                    elif action == "RENAME": self.logprint("   [SYM] RENAME", name, "->", other)
-                    elif action == "OVERWRITE": self.logprint("   [SYM] OVERW ", name)
+                    if action == "ADD":         self.logprint("   [SYM] ADD    ", name)
+                    elif action == "SKIP_DUP":  self.logprint("   [SYM] SKIP   ", name, "==", other)
+                    elif action == "RENAME":    self.logprint("   [SYM] RENAME ", name, "->", other)
+                    elif action == "OVERWRITE": self.logprint("   [SYM] OVERWR ", name)
                 if res["errors"]:
                     self.logprint("   ", "ERRORS:", "; ".join(res["errors"]))
                 self.logprint("   ",
@@ -431,15 +444,17 @@ class App(tk.Tk):
                     f"3D +{res['models_copied']}"
                 )
 
-            # Summary: count symbols
             sym_path = personal / "symbols.kicad_sym"
-            count = 0
-            if sym_path.exists() and not self.dry_run.get():
-                try: count = sym_path.read_text(encoding="utf-8", errors="ignore").count("(symbol ")
-                except Exception as e: self.logprint("WARN: could not read symbols.kicad_sym:", e)
-            self.logprint(f"\nSummary: symbols.kicad_sym contains {count} symbol(s). (Dry run: {self.dry_run.get()})")
+            if not self.dry_run.get():
+                final_count = self._count_top_level(sym_path)
+                self.logprint(f"\nSummary: symbols.kicad_sym contains {final_count} top-level symbol(s). (Dry run: {self.dry_run.get()})")
+                messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). symbols.kicad_sym contains {final_count} symbol(s).")
+            else:
+                adds = sum(1 for r in self.results for (_n,a,_o) in r.get("symbol_names_debug", []) if a in ("ADD","RENAME"))
+                est = initial_count + adds
+                self.logprint(f"\nSummary (dry-run): initial {initial_count} -> estimated {est} top-level symbol(s) after this run.")
+                messagebox.showinfo("Dry run complete", f"Processed {len(pkgs)} package(s). Estimated symbols after run: {est}.")
             self.logprint("Done. Reload libraries in KiCad to see updates.")
-            messagebox.showinfo("Import complete", f"Processed {len(pkgs)} package(s). symbols.kicad_sym contains {count} symbol(s). Dry run: {self.dry_run.get()}")
         except Exception as e:
             self.logprint("ERROR:", e); messagebox.showerror("Import failed", str(e))
 
@@ -460,8 +475,9 @@ class App(tk.Tk):
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
                 for r in self.results:
                     row = {k: r.get(k, "") for k in cols}
-                    if isinstance(row.get("errors"), list): row["errors"] = "; ".join(row["errors"])
-                    if isinstance(row.get("symbol_names_debug"), list): row["symbol_names_debug"] = "; ".join([f"{a}:{b}->{c}" for a,b,c in row["symbol_names_debug"]])
+                    if isinstance(row.get("errors"), list): row["errors"] = "; ".join(r["errors"])
+                    if isinstance(row.get("symbol_names_debug"), list): 
+                        row["symbol_names_debug"] = "; ".join([f"{a}:{b}->{c}" for a,b,c in r["symbol_names_debug"]])
                     w.writerow(row)
         messagebox.showinfo("Saved", "Report saved.")
 
