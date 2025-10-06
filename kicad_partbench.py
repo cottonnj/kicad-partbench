@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-# KiCad Personal Library Importer — v3.9
-# New in v3.9:
-# • Support custom-named symbol library file (any *.kicad_sym in your personal folder)
-# • Support custom-named footprint folder (any *.pretty in your personal folder)
-# • Auto-detects candidates on folder selection; lets you pick from dropdowns or type a new name
-# • Existing features preserved: importer, pruning, de-dup, repair, 3D audit/fix, view table
-
+# KiCad Personal Library Importer — v4.2
+# Keeps ALL v3.9 features + v4.1 (3D root, relative paths, Delete Parts)
+# NEW in v4.2:
+#  • Import-time 3D pairing: if a package (zip/folder) contains *.kicad_mod and *.step/*.stp/*.wrl,
+#    we assume they belong together and write (model ...) into the imported footprint(s).
+#    Heuristics: 1-to-1 (single FP & single 3D) -> pair; otherwise try name-stem match / fuzzy match;
+#    otherwise, if symbols provide an MPN/Value, try matching 3D to that.
+#  • Symbol-aware "Fix 3D Paths": if no model is found by footprint module name, it also tries
+#    the symbol names/values that reference that footprint.
+#
+# Python stdlib only (tkinter).
 import os, re, shutil, tempfile, zipfile, time, json, csv, textwrap, hashlib
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "kicad-personal-importer-v3.9")\n'
-NONESSENTIAL_PROPS = {
-    "Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
-    "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
-    "Link","URL","Alt","Notes"
-}
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "kicad-personal-importer-v4.2")\n'
+NONESSENTIAL_PROPS = {"Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
+                      "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
+                      "Link","URL","Alt","Notes"}
 PREFS_FILE = Path.home() / ".kicad_personal_importer.json"
 
-# -------------------- Filesystem + discovery --------------------
 def ensure_paths(personal_dir: Path, sym_name: str, fp_folder: str):
     (personal_dir / fp_folder).mkdir(parents=True, exist_ok=True)
     (personal_dir / "3d" / "step").mkdir(parents=True, exist_ok=True)
@@ -37,16 +38,12 @@ def find_files(root: Path, patterns):
     return out
 
 def package_has_content(p: Path):
-    if p.is_file() and p.suffix.lower() == ".zip":
-        return True
-    if not p.is_dir():
-        return False
+    if p.is_file() and p.suffix.lower() == ".zip": return True
+    if not p.is_dir(): return False
     for pat in ("*.kicad_sym","*.kicad_mod","*.step","*.stp","*.wrl"):
-        if list(p.glob(pat)):
-            return True
+        if list(p.glob(pat)): return True
     for sub in ("KiCADv6","kicad6","KiCad","Library.pretty","footprints.pretty"):
-        if (p / sub).exists():
-            return True
+        if (p / sub).exists(): return True
     return False
 
 def gather_packages(source: Path, recurse=True):
@@ -54,8 +51,7 @@ def gather_packages(source: Path, recurse=True):
     if source.is_file() and source.suffix.lower() == ".zip":
         pkgs.append(("zip", source)); return pkgs
     if source.is_dir():
-        if package_has_content(source):
-            pkgs.append(("dir", source))
+        if package_has_content(source): pkgs.append(("dir", source))
         if recurse:
             for p in source.rglob("*"):
                 if p.is_file() and p.suffix.lower() == ".zip":
@@ -80,8 +76,7 @@ def prune_packages(pkgs, prefer="folder"):
     leaf = [(k,p) for (k,p) in abs_pkgs if not (k == "dir" and p in parent_dirs)]
     grouped = {}
     for kind, p in leaf:
-        parent = p.parent
-        stem = p.stem if kind == "zip" else p.name
+        parent = p.parent; stem = p.stem if kind == "zip" else p.name
         grouped.setdefault((str(parent), stem.lower()), []).append((kind, p))
     pruned = []
     for _, items in grouped.items():
@@ -96,12 +91,173 @@ def prune_packages(pkgs, prefer="folder"):
             pruned.append(latest)
     return pruned
 
-# -------------------- 3D + Footprints --------------------
+# --------------- 3D helpers ---------------
+def _canon(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+def _score(a: str, b: str) -> float:
+    if not a or not b: return 0.0
+    if a == b: return 1.0
+    def grams(t):
+        return {t[i:i+4] for i in range(max(1, len(t)-3))}
+    ga, gb = grams(a), grams(b); inter = len(ga & gb); union = len(ga | gb) or 1
+    base = inter/union
+    bonus = 0.1 if a[:6]==b[:6] else 0.0
+    bonus += 0.1 if a[-6:]==b[-6:] else 0.0
+    return min(1.0, base+bonus)
+
+def _available_models_index(models_root: Path):
+    exact, stems, canon, all_files = {}, {}, {}, []
+    if models_root.exists():
+        for f in models_root.rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".step",".stp",".wrl"):
+                exact[f.name.lower()] = f
+                stems.setdefault(f.stem.lower(), []).append(f)
+                canon.setdefault(_canon(f.stem), []).append(f)
+                all_files.append(f)
+    return exact, stems, canon, all_files
+
+def _prefer_ext(files_with_same_stem: list, prefer: str):
+    order = [".step",".stp",".wrl"] if prefer == "step" else [".wrl",".step",".stp"]
+    for ext in order:
+        for f in files_with_same_stem:
+            if f.suffix.lower() == ext: return f
+    return files_with_same_stem[0] if files_with_same_stem else None
+
+def _choose_local_model_smart(all_idx, key_name: str, prefer: str="step"):
+    exact, stems, canon, files = all_idx
+    base = Path(key_name.replace("\\","/")).name.lower()
+    if base in exact: return exact[base]
+    st = Path(base).stem.lower()
+    if st in stems: return _prefer_ext(stems[st], prefer)
+    c = _canon(st)
+    if c in canon: return _prefer_ext(canon[c], prefer)
+    best = (None, 0.0)
+    for f in files:
+        sc = _score(_canon(f.stem), c)
+        if sc > best[1]: best = (f, sc)
+    return best[0] if best[1] >= 0.62 else None
+
+def _rewrite_all_models(txt: str, chooser, make_rel=None):
+    def repl(m):
+        path = m.group(1) or m.group(2)
+        local = chooser(path)
+        if local:
+            if make_rel:
+                relpath = make_rel(local)
+                return f'(model "{relpath}"'
+            else:
+                sub = "step" if local.suffix.lower() in (".step",".stp") else "wrl"
+                return f'(model "${{PERSONAL_LIB_DIR}}/3d/{sub}/{local.name}"'
+        return m.group(0)
+    return re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', repl, txt)
+
+# --------------- Symbols ---------------
+def parse_symbol_blocks(text: str):
+    blocks = []
+    i, n = 0, len(text)
+    while True:
+        i = text.find("(symbol ", i)
+        if i == -1: break
+        mname = re.search(r'\(symbol\s+"([^"]+)"', text[i:])
+        if not mname: break
+        name = mname.group(1)
+        depth, j = 0, i
+        while j < n:
+            ch = text[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1; break
+            j += 1
+        block = text[i:j]
+        blocks.append((name, block))
+        i = j
+    return blocks
+
+def sanitize_block(parent_name: str, block: str) -> str:
+    s = textwrap.dedent(block.strip())
+    k = s.find("(symbol ");  s = s[k:] if k >= 0 else s
+    s = re.sub(r'\(hide\)', '(hide yes)', s)
+    # unit name normalization (keeps parent as prefix)
+    matches = list(re.finditer(r'\(symbol\s+"([^"]+)"', s))
+    if len(matches) > 1:
+        for m in reversed(matches[1:]):
+            child = m.group(1)
+            mu = re.match(r'^(.*)_(\d+)_(\d+)$', child)
+            if mu:
+                u, c = max(1,int(mu.group(2))), max(1,int(mu.group(3)))
+                new_name = f'{parent_name}_{u}_{c}'
+            else:
+                new_name = f'{parent_name}_1_1'
+            s = s[:m.start(1)] + new_name + s[m.end(1):]
+    lines = []
+    for ln in s.splitlines():
+        lines.append("  " + ln.lstrip().replace("\t", "  "))
+    return "\n".join(lines)
+
+def strip_footprint_prop(block: str):
+    return re.sub(r'\(\s*property\s+"Footprint"\s+"[^"]*"\s*\(.*?\)\s*\)', '', block, flags=re.DOTALL)
+
+def strip_prop_ids(block: str):
+    s = re.sub(r'\(id\s+\d+\)', '', block)
+    s = re.sub(r'\(uuid\s+[^)]+\)', '', s)
+    s = re.sub(r'\(at\s+[^)]+\)', '', s)
+    s = re.sub(r'\(effects\s+\(.*?\)\)', '', s, flags=re.DOTALL)
+    return s
+
+def drop_nonessential_props(block: str):
+    def repl(m):
+        name = m.group(1)
+        if name in NONESSENTIAL_PROPS: return ''
+        return f'(property "{name}" "{m.group(2)}")'
+    return re.sub(r'\(\s*property\s+"([^"]+)"\s+"([^"]*)".*?\)', repl, block, flags=re.DOTALL)
+
+def canonical_content(block: str, mode: str, ignore_footprint=True) -> str:
+    s = re.sub(r'\s+', ' ', block).strip()
+    if mode == "Exact": return s
+    s = strip_prop_ids(s)
+    if ignore_footprint: s = strip_footprint_prop(s)
+    s = drop_nonessential_props(s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    if mode == "Pins-only":
+        pins = []
+        for m in re.finditer(r'\(pin\s+([a-zA-Z0-9_]+)\s+[a-zA-Z0-9_]+\s*\(.*?\(number\s+"([^"]+)"\).*?\(name\s+"([^"]*)"\)', s, flags=re.DOTALL):
+            pins.append((m.group(1), m.group(2), m.group(3)))
+        pins.sort()
+        return json.dumps(pins, separators=(',',':'))
+    return s
+
+def read_personal_symbols(sym_path: Path, mode: str, ignore_footprint=True):
+    if not sym_path.exists(): return {}, {}
+    raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+    merged = {}; content_map = {}
+    for name, block in parse_symbol_blocks(raw):
+        sanitized = sanitize_block(name, block)
+        canon = canonical_content(sanitized, mode, ignore_footprint=ignore_footprint)
+        merged[name] = sanitized
+        content_map[hashlib.sha1(canon.encode("utf-8")).hexdigest()] = name
+    return merged, content_map
+
+def write_symbols_file(sym_path: Path, blocks_by_name: dict):
+    out = [HEADER]
+    for name in sorted(blocks_by_name.keys(), key=lambda s: s.lower()):
+        out.append(blocks_by_name[name].rstrip() + "\n")
+    out.append(")\n")
+    backup = sym_path.with_suffix(".kicad_sym.bak")
+    if sym_path.exists():
+        try: sym_path.rename(backup)
+        except Exception: shutil.copy2(sym_path, backup)
+    Path(sym_path).write_text("".join(out), encoding="utf-8")
+    return str(backup)
+
+# --------------- Import copy helpers ---------------
 def copy_3d_models(staging: Path, personal: Path, overwrite=False, log=lambda *a: None):
     steps = find_files(staging, ["*.step", "*.stp"])
     wrls  = find_files(staging, ["*.wrl"])
-    mapping = {}
-    copied = 0
+    mapping = {}; copied = 0
     for f in steps:
         dest = personal / "3d" / "step" / f.name
         if overwrite or not dest.exists():
@@ -130,117 +286,7 @@ def import_footprints(staging: Path, personal: Path, fp_folder: str, overwrite=F
             errors.append(f"{src.name}: {e}"); log(f"[FP] ERROR {src.name}: {e}")
     return out_paths, imported, skipped, errors
 
-# -------------------- Symbols --------------------
-def parse_symbol_blocks(text: str):
-    blocks = []
-    i, n = 0, len(text)
-    while True:
-        i = text.find("(symbol ", i)
-        if i == -1: break
-        mname = re.search(r'\(symbol\s+"([^"]+)"', text[i:])
-        if not mname: break
-        name = mname.group(1)
-        depth, j = 0, i
-        while j < n:
-            ch = text[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    j += 1; break
-            j += 1
-        block = text[i:j]
-        blocks.append((name, block))
-        i = j
-    return blocks
-
-def fix_units_in_block(parent_name: str, block: str):
-    matches = list(re.finditer(r'\(symbol\s+"([^"]+)"', block))
-    if not matches or len(matches) == 1: return block
-    new_block = block
-    for m in reversed(matches[1:]):  # fix inner symbol names
-        child = m.group(1)
-        mu = re.match(r'^(.*)_(\d+)_(\d+)$', child)
-        if mu:
-            u, c = max(1,int(mu.group(2))), max(1,int(mu.group(3)))
-            new_name = f'{parent_name}_{u}_{c}'
-        else:
-            new_name = f'{parent_name}_1_1'
-        s,e = m.span(1)
-        new_block = new_block[:s] + new_name + new_block[e:]
-    return new_block
-
-def sanitize_block(parent_name: str, block: str) -> str:
-    s = textwrap.dedent(block.strip())
-    k = s.find("(symbol ");  s = s[k:] if k >= 0 else s
-    s = re.sub(r'\(hide\)', '(hide yes)', s)
-    s = fix_units_in_block(parent_name, s)
-    lines = []
-    for ln in s.splitlines():
-        lines.append("  " + ln.lstrip().replace("\t", "  "))
-    return "\n".join(lines)
-
-def strip_footprint_prop(block: str):
-    return re.sub(r'\(\s*property\s+"Footprint"\s+"[^"]*"\s*\(.*?\)\s*\)', '', block, flags=re.DOTALL)
-
-def strip_prop_ids(block: str):
-    s = re.sub(r'\(id\s+\d+\)', '', block)
-    s = re.sub(r'\(uuid\s+[^)]+\)', '', s)
-    s = re.sub(r'\(at\s+[^)]+\)', '', s)
-    s = re.sub(r'\(effects\s+\(.*?\)\)', '', s, flags=re.DOTALL)
-    return s
-
-def drop_nonessential_props(block: str):
-    def repl(m):
-        name = m.group(1)
-        if name in NONESSENTIAL_PROPS:
-            return ''
-        return f'(property "{name}" "{m.group(2)}")'
-    return re.sub(r'\(\s*property\s+"([^"]+)"\s+"([^"]*)".*?\)', repl, block, flags=re.DOTALL)
-
-def canonical_content(block: str, mode: str, ignore_footprint=True) -> str:
-    s = re.sub(r'\s+', ' ', block).strip()
-    if mode == "Exact":
-        return s
-    s = strip_prop_ids(s)
-    if ignore_footprint:
-        s = strip_footprint_prop(s)
-    s = drop_nonessential_props(s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    if mode == "Pins-only":
-        pins = []
-        for m in re.finditer(r'\(pin\s+([a-zA-Z0-9_]+)\s+[a-zA-Z0-9_]+\s*\(.*?\(number\s+"([^"]+)"\).*?\(name\s+"([^"]*)"\)', s, flags=re.DOTALL):
-            pins.append((m.group(1), m.group(2), m.group(3)))
-        pins.sort()
-        return json.dumps(pins, separators=(',',':'))
-    return s
-
-def read_personal_symbols(sym_path: Path, mode: str, ignore_footprint=True):
-    if not sym_path.exists():
-        return {}, {}
-    raw = sym_path.read_text(encoding="utf-8", errors="ignore")
-    merged = {}
-    content_map = {}
-    for name, block in parse_symbol_blocks(raw):
-        sanitized = sanitize_block(name, block)
-        canon = canonical_content(sanitized, mode, ignore_footprint=ignore_footprint)
-        merged[name] = sanitized
-        content_map[hashlib.sha1(canon.encode("utf-8")).hexdigest()] = name
-    return merged, content_map
-
-def write_symbols_file(sym_path: Path, blocks_by_name: dict):
-    out = [HEADER]
-    for name in sorted(blocks_by_name.keys(), key=lambda s: s.lower()):
-        out.append(blocks_by_name[name].rstrip() + "\n")
-    out.append(")\n")
-    backup = sym_path.with_suffix(".kicad_sym.bak")
-    if sym_path.exists():
-        try: sym_path.rename(backup)
-        except Exception: shutil.copy2(sym_path, backup)
-    Path(sym_path).write_text("".join(out), encoding="utf-8")
-    return str(backup)
-
+# --------------- Symbol merge ---------------
 def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_paths: list,
                          autoset_fp=True, fp_nick="Personal_Footprints", overwrite=False,
                          mode="Ignore Properties", ignore_footprint_for_dedupe=True, log=lambda *a: None):
@@ -278,8 +324,7 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
             if h in content_index:
                 kept = content_index[h]
                 stats["skipped_content_dupe"].append((name, kept))
-                stats["debug_symbols"].append((name, "SKIP_DUP", kept))
-                log(f"[SYM] Skip duplicate by content: {name} == {kept}")
+                stats["debug_symbols"].append((name, "SKIP_DUP", kept)); log(f"[SYM] Skip duplicate by content: {name} == {kept}")
                 continue
 
             if name in merged:
@@ -292,14 +337,13 @@ def merge_symbols_strict(personal_sym: Path, vendor_syms: list, imported_fp_path
                         k += 1; new_name = f"{name}_imp{k}"
                     sanitized = re.sub(r'\(symbol\s+"([^"]+)"', f'(symbol "{new_name}"', sanitized, count=1)
                     merged[new_name] = sanitized; content_index[h] = new_name
-                    stats["renamed"].append((name, new_name)); stats["debug_symbols"].append((name, "RENAME", new_name))
-                    log(f"[SYM] Renamed: {new_name}")
+                    stats["renamed"].append((name, new_name)); stats["debug_symbols"].append((name, "RENAME", new_name)); log(f"[SYM] Renamed: {new_name}")
             else:
                 merged[name] = sanitized; content_index[h] = name; stats["added"].append(name); stats["debug_symbols"].append((name, "ADD", name))
 
     return stats, merged
 
-# ---- unzip/prepare ----
+# --------------- ZIP staging ---------------
 def unzip_if_needed(path: Path):
     if path.is_dir(): return path, None
     if path.is_file() and path.suffix.lower() == ".zip":
@@ -308,26 +352,135 @@ def unzip_if_needed(path: Path):
         return tmp, tmp
     raise FileNotFoundError("Source is neither a directory nor a .zip")
 
+# --------------- Import-time 3D pairing ---------------
+def _symbol_candidates_from_files(symbol_files):
+    cands = set()
+    for symlib in symbol_files:
+        txt = Path(symlib).read_text(encoding="utf-8", errors="ignore")
+        for name, block in parse_symbol_blocks(txt):
+            cands.add(name)
+            m = re.search(r'\(\s*property\s+"Value"\s+"([^"]*)"', block)
+            if m and m.group(1): cands.add(m.group(1))
+            m = re.search(r'\(\s*property\s+"MPN"\s+"([^"]*)"', block)
+            if m and m.group(1): cands.add(m.group(1))
+    return {c for c in cands if c and len(c) >= 3}
+
+def _choose_from_models(models, key, prefer="step"):
+    # choose best model Path from list for a key string
+    if not models: return None
+    keyc = _canon(Path(key).stem)
+    best = (None, 0.0)
+    for f in models:
+        sc = _score(_canon(f.stem), keyc)
+        if sc > best[1]: best = (f, sc)
+    if best[0] and best[1] >= 0.62:
+        # prefer extension
+        same_stem = [m for m in models if _canon(m.stem) == _canon(best[0].stem)]
+        if same_stem:
+            return _prefer_ext(same_stem, prefer)
+        return best[0]
+    return None
+
+def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_dir: Path, use_relative: bool):
+
+    txt = mod_path.read_text(encoding="utf-8", errors="ignore")
+    personal_root = mod_path.parent.parent  # parent of *.pretty is personal root
+
+    # Build the path we will write
+    if use_relative:
+        try:
+            rel = os.path.relpath(model_path, start=relative_to_dir).replace("\\\\","/")
+        except Exception:
+            rel = model_path.name
+        new_model_str = f'(model "{rel}")'
+    else:
+        sub = "step" if model_path.suffix.lower() in (".step",".stp") else "wrl"
+        rel = f'${{PERSONAL_LIB_DIR}}/3d/{sub}/{model_path.name}'
+        new_model_str = f'(model "{rel}")'
+
+    # Check if an equivalent model is already present (compare by filename, case-insensitive)
+    existing = [mm.group(1) or mm.group(2) for mm in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
+    new_key = _norm_model_key(rel, relative_to_dir, personal_root)
+    for pstr in existing:
+        if _norm_model_key(pstr, relative_to_dir, personal_root) == new_key:
+            cleaned = _dedupe_models_in_text(txt, relative_to_dir, personal_root)
+            if cleaned != txt:
+                mod_path.write_text(cleaned, encoding="utf-8")
+            return
+
+    # Append and then dedupe as a safety net
+    if txt.rstrip().endswith(')'):
+        txt2 = txt.rstrip()[:-1] + f"\\n  {new_model_str}\\n)"
+    else:
+        txt2 = txt + f"\\n  {new_model_str}\\n"
+    txt2 = _dedupe_models_in_text(txt2, relative_to_dir, personal_root)
+    mod_path.write_text(txt2, encoding="utf-8")
+
+
 def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, personal_sym: Path,
                         fp_nick="Personal_Footprints", autoset_fp=True, overwrite=False, mode="Ignore Properties",
-                        ignore_footprint_for_dedupe=True, dry_run=False, log=lambda *a: None):
+                        ignore_footprint_for_dedupe=True, dry_run=False, log=lambda *a: None,
+                        import_pair_models=True, prefer_model_ext="step", force_relative_models=False):
     res = {
         "package": str(path), "kind": kind,
         "footprints_imported": 0, "footprints_skipped": 0, "footprints_errors": 0,
         "symbols_added": 0, "symbols_renamed": 0, "symbols_overwritten": 0,
         "symbols_skipped_content_dupe": 0, "models_copied": 0, "errors": [],
-        "symbol_names_debug": []
+        "symbol_names_debug": [], "models_paired": 0
     }
     try:
         if kind == "zip": staging, tmpdir = unzip_if_needed(path)
         else: staging, tmpdir = (path, None)
 
+        # copy 3D + footprints
         model_map, copied3d = copy_3d_models(staging, personal, overwrite=overwrite, log=log)
         res["models_copied"] = copied3d
-
         fps_paths, imported, skipped, fp_errs = import_footprints(staging, personal, fp_folder, overwrite=overwrite, log=log)
         res["footprints_imported"] = len(imported); res["footprints_skipped"] = len(skipped); res["footprints_errors"] = len(fp_errs)
 
+        # Import-time 3D pairing
+        if import_pair_models and not dry_run and fps_paths:
+            # Collect models present in staging
+            staged_models = [*find_files(staging, ["*.step","*.stp","*.wrl"])]
+            # Prefer within the same zip/folder
+            if staged_models:
+                # Candidates from symbols
+                sym_files = find_files(staging, ["*.kicad_sym"])
+                sym_cands = _symbol_candidates_from_files(sym_files)
+                # One-to-one fast path
+                if len(fps_paths) == 1 and len(staged_models) == 1:
+                    _write_model_into_footprint(fps_paths[0], personal / ("3d/step" if staged_models[0].suffix.lower() in (".step",".stp") else "3d/wrl") / staged_models[0].name,
+                                                personal / fp_folder, force_relative_models)
+                    res["models_paired"] += 1
+                    log(f"[3D] Paired (1:1): {Path(fps_paths[0]).name} -> {staged_models[0].name}")
+                else:
+                    # fuzzy map
+                    # Build list of destination model paths (after copy)
+                    dest_models = []
+                    for m in staged_models:
+                        sub = "step" if m.suffix.lower() in (".step",".stp") else "wrl"
+                        dest_models.append((m, personal / "3d" / sub / m.name))
+                    for mod_path in fps_paths:
+                        try:
+                            txt = Path(mod_path).read_text(encoding="utf-8", errors="ignore")
+                            if re.search(r'\(model\s+', txt):  # already has model
+                                continue
+                            # match by module stem first
+                            stem = Path(mod_path).stem
+                            best = _choose_from_models([p for (_m,p) in dest_models], stem, prefer=prefer_model_ext)
+                            if not best and sym_cands:
+                                # try symbol names/values
+                                for cand in sorted(sym_cands, key=len, reverse=True):
+                                    best = _choose_from_models([p for (_m,p) in dest_models], cand, prefer=prefer_model_ext)
+                                    if best: break
+                            if best:
+                                _write_model_into_footprint(mod_path, best, personal / fp_folder, force_relative_models)
+                                res["models_paired"] += 1
+                                log(f"[3D] Paired: {Path(mod_path).name} -> {best.name}")
+                        except Exception as e:
+                            log(f"[3D] Pairing error for {Path(mod_path).name}: {e}")
+
+        # Merge symbols last
         syms = find_files(staging, ["*.kicad_sym"])
         if syms:
             stats, merged = merge_symbols_strict(personal_sym, syms, fps_paths,
@@ -345,72 +498,21 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
         res["errors"].append(str(e))
     return res
 
-# -------------------- 3D match & fix helpers --------------------
-def _canon(s: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', s.lower())
-
-def _score(a: str, b: str) -> float:
-    if not a or not b: return 0.0
-    if a == b: return 1.0
-    def grams(t):
-        return {t[i:i+4] for i in range(max(1, len(t)-3))}
-    ga, gb = grams(a), grams(b)
-    inter = len(ga & gb); union = len(ga | gb) or 1
-    base = inter / union
-    bonus = 0.1 if a[:6] == b[:6] else 0.0
-    bonus += 0.1 if a[-6:] == b[-6:] else 0.0
-    return min(1.0, base + bonus)
-
-def _available_models_index(models_root: Path):
-    exact = {}
-    stems = {}
-    canon = {}
-    all_files = []
-    if models_root.exists():
-        for f in models_root.rglob("*"):
-            if f.is_file() and f.suffix.lower() in (".step",".stp",".wrl"):
-                exact[f.name.lower()] = f
-                stems[f.stem.lower()] = f
-                canon[_canon(f.stem)] = f
-                all_files.append(f)
-    return exact, stems, canon, all_files
-
-def _prefer_ext(files_with_same_stem: list, prefer: str):
-    order = [".step",".stp",".wrl"] if prefer == "step" else [".wrl",".step",".stp"]
-    for ext in order:
-        for f in files_with_same_stem:
-            if f.suffix.lower() == ext:
-                return f
-    return files_with_same_stem[0] if files_with_same_stem else None
-
-def _choose_local_model_smart(all_idx, key_name: str, prefer: str="step"):
-    exact, stems, canon, files = all_idx
-    base = Path(key_name.replace("\\","/")).name.lower()
-    if base in exact: return exact[base]
-    st = Path(base).stem.lower()
-    if st in stems:
-        options = [f for f in files if f.stem.lower() == st]
-        return _prefer_ext(options, prefer) or stems[st]
-    c = _canon(st)
-    if c in canon:
-        options = [f for f in files if _canon(f.stem) == c]
-        return _prefer_ext(options, prefer) or canon[c]
-    best = (None, 0.0)
-    for f in files:
-        sc = _score(_canon(f.stem), c)
-        if sc > best[1]:
-            best = (f, sc)
-    return best[0] if best[1] >= 0.62 else None
-
-def _rewrite_all_models(txt: str, chooser):
-    def repl(m):
-        path = m.group(1) or m.group(2)
-        local = chooser(path)
-        if local:
-            rel = "${PERSONAL_LIB_DIR}/3d/" + ( "step/" if local.suffix.lower() in (".step",".stp") else "wrl/" ) + local.name
-            return f'(model "{rel}"'
-        return m.group(0)
-    return re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', repl, txt)
+# --------------- Symbol-aware Fix 3D ---------------
+def _footprint_to_symbol_cands(sym_path: Path):
+    # Map: module_name -> set of textual candidates (symbol name, Value, MPN)
+    out = {}
+    if not sym_path.exists(): return out
+    raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+    for name, block in parse_symbol_blocks(raw):
+        m = re.search(r'\(\s*property\s+"Footprint"\s+"([^"]+)"', block)
+        if not m: continue
+        mod = m.group(1).split(":")[-1].strip()
+        vals = {name}
+        mv = re.search(r'\(\s*property\s+"Value"\s+"([^"]*)"', block);  vals.add(mv.group(1)) if mv and mv.group(1) else None
+        mm = re.search(r'\(\s*property\s+"MPN"\s+"([^"]*)"', block);    vals.add(mm.group(1)) if mm and mm.group(1) else None
+        out.setdefault(mod, set()).update(v for v in vals if v and len(v) >= 3)
+    return out
 
 def audit_footprints(fp_dir: Path, models_root: Path):
     rows = []
@@ -431,22 +533,39 @@ def audit_footprints(fp_dir: Path, models_root: Path):
         rows.append((mod_path.stem, status, icon, f"{found}/{total}"))
     return rows
 
-def fix_footprint_models(fp_dir: Path, models_root: Path, dry_run: bool=True, add_if_missing: bool=True, prefer_ext: str="step"):
+def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Path=None, dry_run: bool=True, add_if_missing: bool=True, prefer_ext: str="step", force_relative: bool=False):
     all_idx = _available_models_index(models_root)
     changed = 0; total = 0; modified = []
+    sym_cands = _footprint_to_symbol_cands(sym_path) if sym_path else {}
+
+    def relmaker(local_path: Path):
+        try: rp = os.path.relpath(local_path, start=fp_dir)
+        except Exception: rp = local_path.name
+        return rp.replace("\\","/")
+
     for mod_path in sorted(fp_dir.glob("*.kicad_mod"), key=lambda p: p.name.lower()):
         total += 1
         txt = mod_path.read_text(encoding="utf-8", errors="ignore")
         models = [m.group(1) or m.group(2) for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
         new_txt = txt
+        def chooser(old): return _choose_local_model_smart(all_idx, old, prefer=prefer_ext)
+        make_rel = (lambda p: relmaker(p)) if force_relative else None
         if models:
-            def chooser(old):
-                return _choose_local_model_smart(all_idx, old, prefer=prefer_ext)
-            new_txt = _rewrite_all_models(new_txt, chooser)
+            new_txt = _rewrite_all_models(new_txt, chooser, make_rel=make_rel)
         elif add_if_missing:
+            # try by module name first
             cand = _choose_local_model_smart(all_idx, mod_path.stem, prefer=prefer_ext)
+            if not cand and sym_cands.get(mod_path.stem):
+                # try symbol-aware candidates
+                for key in sorted(sym_cands[mod_path.stem], key=len, reverse=True):
+                    cand = _choose_local_model_smart(all_idx, key, prefer=prefer_ext)
+                    if cand: break
             if cand:
-                rel = "${PERSONAL_LIB_DIR}/3d/" + ( "step/" if cand.suffix.lower() in (".step",".stp") else "wrl/" ) + cand.name
+                if force_relative:
+                    rel = relmaker(cand)
+                else:
+                    sub = "step" if cand.suffix.lower() in (".step",".stp") else "wrl"
+                    rel = f'${{PERSONAL_LIB_DIR}}/3d/{sub}/{cand.name}'
                 insert = f'\n  (model "{rel}")\n'
                 if new_txt.rstrip().endswith(')'):
                     new_txt = new_txt.rstrip()[:-1] + insert + ")\n"
@@ -459,14 +578,93 @@ def fix_footprint_models(fp_dir: Path, models_root: Path, dry_run: bool=True, ad
                 try: mod_path.rename(bak)
                 except Exception: pass
                 mod_path.write_text(new_txt, encoding="utf-8")
+        # Always collapse duplicate model entries (idempotent)
+        new_txt = _dedupe_models_in_text(new_txt, fp_dir, Path(fp_dir).parent)
+
     return changed, total, modified
+
+# -------------------- Delete Parts helpers --------------------
+def list_symbols(sym_path: Path):
+    if not sym_path.exists(): return []
+    raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+    return parse_symbol_blocks(raw)
+
+def get_symbol_footprint(block: str):
+    m = re.search(r'\(\s*property\s+"Footprint"\s+"([^"]+)"', block)
+    if not m: return None
+    fp = m.group(1)
+    return fp.split(":")[-1].strip() if ":" in fp else fp.strip()
+
+def rebuild_symbols(sym_path: Path, keep: dict, backup: bool=True):
+    header = '(kicad_symbol_lib (version 20211014) (generator "delete-tool-merged-4.2")\n'
+    body = [header]
+    for name in sorted(keep.keys(), key=lambda s: s.lower()):
+        body.append(keep[name].rstrip() + "\n")
+    body.append(")\n")
+    if backup and sym_path.exists():
+        bak = sym_path.with_suffix(".kicad_sym.bak")
+        try: sym_path.rename(bak)
+        except Exception:
+            import shutil as _sh; _sh.copy2(sym_path, bak)
+    sym_path.write_text("".join(body), encoding="utf-8")
+
+def models_in_footprint(mod_path: Path):
+    if not mod_path.exists(): return []
+    txt = mod_path.read_text(encoding="utf-8", errors="ignore")
+    return [m.group(1) or m.group(2) for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
+
+def expand_personal_var(path_str: str, personal_root: Path) -> Path:
+    path_str = path_str.replace("\\", "/")
+    if "${PERSONAL_LIB_DIR}" in path_str:
+        rest = path_str.split("}", 1)[1].lstrip("/")
+        return personal_root / rest
+    return Path(path_str)
+
+def _norm_model_key(path_str: str, fp_dir: Path, personal_root: Path) -> str:
+    try:
+        p = path_str.replace("\\", "/")
+    except Exception:
+        p = str(path_str)
+    if "${PERSONAL_LIB_DIR}" in p:
+        rest = p.split("}", 1)[1].lstrip("/")
+        p = str((personal_root / rest).resolve())
+    try:
+        if not (p.startswith("/") or re.match(r'^[A-Za-z]:/', p)):
+            p = str((fp_dir / p).resolve())
+    except Exception:
+        pass
+    key = Path(p).name.lower()
+    return key
+
+def _dedupe_models_in_text(txt: str, fp_dir: Path, personal_root: Path) -> str:
+    models = [(m.group(0), m.group(1) or m.group(2)) for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
+    if not models:
+        return txt
+    seen = set()
+    keep = []
+    for full, path in models:
+        key = _norm_model_key(path, fp_dir, personal_root)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(full)
+    if len(keep) == len(models):
+        return txt
+    base = re.sub(r'\s*\(model\s+(?:"[^"]+"|[^\s)]+)\s*\)', '', txt)
+    insert_block = "".join(f"\n  {k}" for k in keep)
+    base = base.rstrip()
+    if base.endswith(')'):
+        base = base[:-1] + insert_block + "\n)"
+    else:
+        base = base + insert_block
+    return base
 
 # -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("KiCad Personal Library Importer — v3.9")
-        self.geometry("1140x820")
+        self.title("KiCad Personal Library Importer — v4.2")
+        self.geometry("1180x880")
 
         self.source = tk.StringVar(); self.personal = tk.StringVar()
         self.nick = tk.StringVar(value="Personal_Footprints")
@@ -477,31 +675,38 @@ class App(tk.Tk):
         self.dedupe_mode = tk.StringVar(value="Ignore Properties")
         self.dry_run = tk.BooleanVar(value=False)
         self.prefer_pkg = tk.StringVar(value="folder")
-
         self.sym_choice = tk.StringVar(value="symbols.kicad_sym")
         self.fp_choice = tk.StringVar(value="footprints.pretty")
+
+        self.models_root = tk.StringVar()
+        self.force_relative_models = tk.BooleanVar(value=True)
 
         self.prefs = self.load_prefs()
         if self.prefs.get("last_source_dir"): self.source.set(self.prefs["last_source_dir"])
         if self.prefs.get("last_personal_dir"): self.personal.set(self.prefs["last_personal_dir"])
         if self.prefs.get("sym_choice"): self.sym_choice.set(self.prefs["sym_choice"])
         if self.prefs.get("fp_choice"): self.fp_choice.set(self.prefs["fp_choice"])
+        if self.prefs.get("models_root"): self.models_root.set(self.prefs["models_root"])
+        if "force_relative_models" in self.prefs: self.force_relative_models.set(self.prefs["force_relative_models"])
 
         r = 0
-        tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=6, sticky="w", padx=8, pady=(10,4)); r += 1
-        tk.Entry(self, textvariable=self.source, width=120).grid(row=r, column=0, columnspan=5, sticky="we", padx=8)
-        tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=5, padx=8); r += 1
+        tk.Label(self, text="Source (ZIP, single folder, or a directory containing many packages):").grid(row=r, column=0, columnspan=7, sticky="w", padx=8, pady=(10,4)); r += 1
+        tk.Entry(self, textvariable=self.source, width=120).grid(row=r, column=0, columnspan=6, sticky="we", padx=8)
+        tk.Button(self, text="Browse…", command=self.pick_source).grid(row=r, column=6, padx=8); r += 1
 
-        tk.Label(self, text="Personal library folder (contains your symbol lib and *.pretty folder):").grid(row=r, column=0, columnspan=6, sticky="w", padx=8, pady=(10,4)); r += 1
-        tk.Entry(self, textvariable=self.personal, width=120).grid(row=r, column=0, columnspan=5, sticky="we", padx=8)
-        tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=5, padx=8); r += 1
+        tk.Label(self, text="Personal library folder (contains your symbol lib and *.pretty folder):").grid(row=r, column=0, columnspan=7, sticky="w", padx=8, pady=(10,4)); r += 1
+        tk.Entry(self, textvariable=self.personal, width=120).grid(row=r, column=0, columnspan=6, sticky="we", padx=8)
+        tk.Button(self, text="Browse…", command=self.pick_personal).grid(row=r, column=6, padx=8); r += 1
 
         tk.Label(self, text="Symbol library file (*.kicad_sym):").grid(row=r, column=0, sticky="e", padx=8)
-        self.sym_combo = ttk.Combobox(self, textvariable=self.sym_choice, values=[], width=40)
-        self.sym_combo.grid(row=r, column=1, sticky="w", padx=8)
+        self.sym_combo = ttk.Combobox(self, textvariable=self.sym_choice, values=[], width=40); self.sym_combo.grid(row=r, column=1, sticky="w", padx=8)
         tk.Label(self, text="Footprint library folder (*.pretty):").grid(row=r, column=2, sticky="e", padx=8)
-        self.fp_combo = ttk.Combobox(self, textvariable=self.fp_choice, values=[], width=40)
-        self.fp_combo.grid(row=r, column=3, sticky="w", padx=8); r += 1
+        self.fp_combo = ttk.Combobox(self, textvariable=self.fp_choice, values=[], width=40); self.fp_combo.grid(row=r, column=3, sticky="w", padx=8)
+
+        tk.Label(self, text="3D models root:").grid(row=r, column=4, sticky="e", padx=8)
+        tk.Entry(self, textvariable=self.models_root, width=28).grid(row=r, column=5, sticky="w", padx=4)
+        tk.Button(self, text="Browse…", command=self.pick_models_root).grid(row=r, column=6, padx=8); r += 1
+        tk.Checkbutton(self, text="Write RELATIVE (model …) paths (relative to *.pretty)", variable=self.force_relative_models).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
 
         tk.Label(self, text="Footprint nickname (for symbol Footprint property):").grid(row=r, column=0, sticky="e", padx=8, pady=(6,2))
         tk.Entry(self, textvariable=self.nick, width=30).grid(row=r, column=1, sticky="w", padx=8, pady=(6,2))
@@ -510,36 +715,35 @@ class App(tk.Tk):
         tk.Label(self, text="If ZIP and folder both exist (same stem):").grid(row=r, column=4, sticky="e", padx=8)
         ttk.Combobox(self, textvariable=self.prefer_pkg, values=["folder","zip"]).grid(row=r, column=5, sticky="w", padx=8); r += 1
 
-        tk.Checkbutton(self, text="Auto-set symbol Footprint when a single footprint is imported", variable=self.autoset).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Ignore Footprint when de-duplicating (recommended)", variable=self.ignore_fp_dedupe).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
-        tk.Checkbutton(self, text="Dry run (don’t write file; just show what would happen)", variable=self.dry_run).grid(row=r, column=0, columnspan=6, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Auto-set symbol Footprint when a single footprint is imported", variable=self.autoset).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Overwrite existing items with same name", variable=self.overwrite).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Process recursively when source is a directory", variable=self.recurse).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Ignore Footprint when de-duplicating (recommended)", variable=self.ignore_fp_dedupe).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
+        tk.Checkbutton(self, text="Dry run (don’t write file; just show what would happen)", variable=self.dry_run).grid(row=r, column=0, columnspan=7, sticky="w", padx=10); r += 1
 
-        btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=6, sticky="we", padx=8, pady=6)
+        btn_row = tk.Frame(self); btn_row.grid(row=r, column=0, columnspan=7, sticky="we", padx=8, pady=6)
         tk.Button(btn_row, text="Import", command=self.run).pack(side="left", padx=4)
         tk.Button(btn_row, text="Validate/Repair symbols file", command=self.repair_now).pack(side="left", padx=4)
         tk.Button(btn_row, text="View Library Parts", command=self.view_library_parts).pack(side="left", padx=4)
         tk.Button(btn_row, text="Audit Footprints (3D)", command=self.audit_footprints_gui).pack(side="left", padx=4)
         tk.Button(btn_row, text="Fix 3D Paths…", command=self.fix_3d_paths_gui).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Delete Parts…", command=self.delete_parts_gui).pack(side="left", padx=4)
         tk.Button(btn_row, text="Export Report", command=self.export_report).pack(side="left", padx=4)
         tk.Button(btn_row, text="Quit", command=self.destroy).pack(side="right", padx=4); r += 1
 
         self.log = ScrolledText(self, wrap="word", height=28)
-        self.log.grid(row=r, column=0, columnspan=6, sticky="nsew", padx=8, pady=8)
+        self.log.grid(row=r, column=0, columnspan=7, sticky="nsew", padx=8, pady=8)
         self.grid_rowconfigure(r, weight=1); self.grid_columnconfigure(1, weight=1)
 
         self.results = []
-
         self.refresh_personal_candidates()
 
-    # ---------- Preferences ----------
+    # Prefs
     def load_prefs(self):
         try:
             if PREFS_FILE.exists():
                 return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception: pass
         return {}
 
     def save_prefs(self):
@@ -548,11 +752,12 @@ class App(tk.Tk):
                 "last_source_dir": self.source.get(),
                 "last_personal_dir": self.personal.get(),
                 "sym_choice": self.sym_choice.get(),
-                "fp_choice": self.fp_choice.get()
+                "fp_choice": self.fp_choice.get(),
+                "models_root": self.models_root.get(),
+                "force_relative_models": self.force_relative_models.get()
             }
             PREFS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception: pass
 
     def _initialdir_for(self, path_str: str):
         try:
@@ -563,8 +768,7 @@ class App(tk.Tk):
                     if p.is_dir(): return str(p)
             if self.prefs.get("last_source_dir") and Path(self.prefs["last_source_dir"]).exists():
                 return self.prefs["last_source_dir"]
-        except Exception:
-            pass
+        except Exception: pass
         return str(Path.home())
 
     def pick_source(self):
@@ -583,14 +787,21 @@ class App(tk.Tk):
         path = filedialog.askdirectory(title="Choose your personal library folder", initialdir=initdir)
         if path:
             self.personal.set(path)
-            self.prefs["last_personal_dir"] = path
+            default3d = Path(path)/"3d"
+            self.models_root.set(str(default3d))
             self.refresh_personal_candidates()
+            self.save_prefs()
+
+    def pick_models_root(self):
+        init = self.models_root.get() or (Path(self.personal.get())/"3d")
+        path = filedialog.askdirectory(title="Choose 3D models root (contains step/ and/or wrl/)", initialdir=str(init))
+        if path:
+            self.models_root.set(path)
             self.save_prefs()
 
     def refresh_personal_candidates(self):
         root = Path(self.personal.get()).expanduser()
-        sym_candidates = []
-        fp_candidates = []
+        sym_candidates = []; fp_candidates = []
         if root.exists() and root.is_dir():
             sym_candidates = sorted([p.name for p in root.glob("*.kicad_sym")])
             fp_candidates = sorted([p.name for p in root.iterdir() if p.is_dir() and p.name.endswith(".pretty")])
@@ -600,27 +811,25 @@ class App(tk.Tk):
             fp_candidates = ["footprints.pretty"] + fp_candidates
         self.sym_combo["values"] = sym_candidates
         self.fp_combo["values"] = fp_candidates
-        if self.sym_choice.get() not in sym_candidates:
-            self.sym_choice.set(sym_candidates[0])
-        if self.fp_choice.get() not in fp_candidates:
-            self.fp_choice.set(fp_candidates[0])
+        if self.sym_choice.get() not in sym_candidates: self.sym_choice.set(sym_candidates[0])
+        if self.fp_choice.get() not in fp_candidates: self.fp_choice.set(fp_candidates[0])
 
     def current_sym_path(self) -> Path:
         return Path(self.personal.get()).expanduser() / self.sym_choice.get()
-
     def current_fp_dir(self) -> Path:
         return Path(self.personal.get()).expanduser() / self.fp_choice.get()
+    def current_models_root(self) -> Path:
+        root = self.models_root.get()
+        return Path(root).expanduser() if root else (Path(self.personal.get()).expanduser() / "3d")
 
-    # ---------- Main actions ----------
+    # actions
     def logprint(self, *args):
         msg = " ".join(str(a) for a in args)
         self.log.insert("end", msg + "\n"); self.log.see("end"); self.update_idletasks()
 
     def _count_top_level(self, sym_path: Path):
-        try:
-            raw = sym_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return 0
+        try: raw = sym_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception: return 0
         return len(parse_symbol_blocks(raw))
 
     def run(self):
@@ -632,13 +841,10 @@ class App(tk.Tk):
             fp_folder = self.fp_choice.get().strip()
             if not src.exists(): messagebox.showerror("Error", "Select a valid source (ZIP or folder)"); return
             if not personal.exists(): messagebox.showerror("Error", "Select your personal library folder"); return
-            if not sym_name.endswith(".kicad_sym"):
-                messagebox.showerror("Error", "Symbol file must end with .kicad_sym"); return
-            if not fp_folder.endswith(".pretty"):
-                messagebox.showerror("Error", "Footprint folder must end with .pretty"); return
+            if not sym_name.endswith(".kicad_sym"): messagebox.showerror("Error", "Symbol file must end with .kicad_sym"); return
+            if not fp_folder.endswith(".pretty"): messagebox.showerror("Error", "Footprint folder must end with .pretty"); return
 
-            personal_sym = ensure_paths(personal, sym_name, fp_folder)
-            self.save_prefs()
+            personal_sym = ensure_paths(personal, sym_name, fp_folder); self.save_prefs()
 
             pkgs = gather_packages(src, recurse=self.recurse.get())
             if not pkgs: messagebox.showwarning("Nothing found", "No KiCad parts found in that source."); return
@@ -649,7 +855,7 @@ class App(tk.Tk):
             self.logprint(f"Starting import… (initial top-level symbols: {initial_count})\n")
 
             for idx, (kind, path) in enumerate(pkgs, 1):
-                self.logprint(f"== [{idx}/{len(pkgs)}] {kind.UPPER() if hasattr(kind,'UPPER') else kind.upper()} :: {path}")
+                self.logprint(f"== [{idx}/{len(pkgs)}] {kind.upper()} :: {path}")
                 def local_log(*a): self.logprint('   ', *a)
                 res = process_one_package(
                     kind, path, personal, fp_folder, personal_sym,
@@ -659,7 +865,10 @@ class App(tk.Tk):
                     mode=self.dedupe_mode.get(),
                     ignore_footprint_for_dedupe=self.ignore_fp_dedupe.get(),
                     dry_run=self.dry_run.get(),
-                    log=local_log
+                    log=local_log,
+                    import_pair_models=True,
+                    prefer_model_ext="step",
+                    force_relative_models=self.force_relative_models.get()
                 )
                 self.results.append(res)
                 for name, action, other in res.get("symbol_names_debug", []):
@@ -672,7 +881,7 @@ class App(tk.Tk):
                 self.logprint("   ",
                     f"FP +{res['footprints_imported']} / skipped {res['footprints_skipped']} ;",
                     f"SYM +{res['symbols_added']} / renamed {res['symbols_renamed']} / overwritten {res['symbols_overwritten']} / content-dupes {res['symbols_skipped_content_dupe']} ;",
-                    f"3D +{res['models_copied']}"
+                    f"3D +{res['models_copied']} ; paired {res['models_paired']}"
                 )
 
             if not self.dry_run.get():
@@ -701,7 +910,7 @@ class App(tk.Tk):
                                                 initialdir=self._initialdir_for(self.source.get()))
         if save_csv:
             cols = ["package","kind","footprints_imported","footprints_skipped","footprints_errors",
-                    "symbols_added","symbols_renamed","symbols_overwritten","symbols_skipped_content_dupe","models_copied","errors"]
+                    "symbols_added","symbols_renamed","symbols_overwritten","symbols_skipped_content_dupe","models_copied","errors","models_paired"]
             with open(save_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
                 for r in self.results:
@@ -728,12 +937,11 @@ class App(tk.Tk):
         self.logprint(f"   Wrote clean symbols file. Backup at: {backup}")
         messagebox.showinfo("Repaired", f"{sym_path.name} rebuilt successfully.")
 
-    # ---------- Library listing ----------
     def view_library_parts(self):
         personal = Path(self.personal.get()).expanduser()
         sym_path = self.current_sym_path()
         fp_dir = self.current_fp_dir()
-        models_root = personal / "3d"
+        models_root = self.current_models_root()
         if not sym_path.exists():
             messagebox.showerror("Error", f"No symbol file at: {sym_path}"); return
         raw = sym_path.read_text(encoding="utf-8", errors="ignore")
@@ -802,7 +1010,7 @@ class App(tk.Tk):
 
         search_frame = tk.Frame(win); search_frame.pack(fill="x", padx=8, pady=4)
         tk.Label(search_frame, text="Filter:").pack(side="left")
-        qvar = tk.StringVar(); ent = tk.Entry(search_frame, textvariable=qvar, width=40); ent.pack(side="left", padx=6)
+        qvar = tk.StringVar(); tk.Entry(search_frame, textvariable=qvar, width=40).pack(side="left", padx=6)
 
         cols = ("Symbol","Footprint Module","Footprint","3D","Models Found")
         tree = ttk.Treeview(win, columns=cols, show="headings", height=24)
@@ -814,8 +1022,7 @@ class App(tk.Tk):
             for r in rows:
                 if q in r[0].lower() or q in r[1].lower():
                     tree.insert("", "end", values=r)
-        qvar.trace_add("write", lambda *_: refill())
-        refill()
+        qvar.trace_add("write", lambda *_: refill()); refill()
         tree.pack(fill="both", expand=True, padx=8, pady=8)
 
         btns = tk.Frame(win); btns.pack(fill="x", padx=8, pady=(0,8))
@@ -831,9 +1038,8 @@ class App(tk.Tk):
         tk.Button(btns, text="Close", command=win.destroy).pack(side="right")
 
     def audit_footprints_gui(self):
-        personal = Path(self.personal.get()).expanduser()
         fp_dir = self.current_fp_dir()
-        models_root = personal / "3d"
+        models_root = self.current_models_root()
         if not fp_dir.exists():
             messagebox.showerror("Error", f"No footprint folder at: {fp_dir}"); return
         rows = audit_footprints(fp_dir, models_root)
@@ -857,29 +1063,31 @@ class App(tk.Tk):
                     w.writerow((mod, status, cnt))
             messagebox.showinfo("Saved", f"Exported {len(rows)} rows.")
         btns = tk.Frame(win); btns.pack(fill="x", padx=8, pady=(0,8))
-        tk.Button(btns, text="Export CSV", command=export_csv).pack(side="left")
+        tk.Button(btns, text="Export to CSV", command=export_csv).pack(side="left")
         tk.Button(btns, text="Close", command=win.destroy).pack(side="right")
 
     def fix_3d_paths_gui(self):
-        personal = Path(self.personal.get()).expanduser()
         fp_dir = self.current_fp_dir()
-        models_root = personal / "3d"
+        models_root = self.current_models_root()
+        sym_path = self.current_sym_path()
         if not fp_dir.exists():
             messagebox.showerror("Error", f"No footprint folder at: {fp_dir}"); return
 
-        win = tk.Toplevel(self); win.title("Fix 3D Paths in Footprints"); win.geometry("660x320")
+        win = tk.Toplevel(self); win.title("Fix 3D Paths in Footprints"); win.geometry("720x380")
         dry = tk.BooleanVar(value=True)
         add_missing = tk.BooleanVar(value=True)
         pref = tk.StringVar(value="step")
+        rel = tk.BooleanVar(value=self.force_relative_models.get())
         tk.Checkbutton(win, text="Dry run (show what would change; don’t write files)", variable=dry).pack(anchor="w", padx=12, pady=6)
-        tk.Checkbutton(win, text="Add (model …) to footprints that have none (by filename match)", variable=add_missing).pack(anchor="w", padx=12, pady=4)
-        opt = tk.Frame(win); opt.pack(anchor="w", padx=12, pady=4)
-        tk.Label(opt, text="Prefer model extension:").pack(side="left")
-        ttk.Combobox(opt, values=["step","wrl"], textvariable=pref, width=10).pack(side="left", padx=6)
-        out = ScrolledText(win, wrap="word", height=9); out.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Checkbutton(win, text="Add (model …) to footprints that have none (by filename / symbol)", variable=add_missing).pack(anchor="w", padx=12, pady=4)
+        row = tk.Frame(win); row.pack(anchor="w", padx=12, pady=4)
+        tk.Label(row, text="Prefer model extension:").pack(side="left")
+        ttk.Combobox(row, values=["step","wrl"], textvariable=pref, width=10).pack(side="left", padx=6)
+        tk.Checkbutton(win, text="Write RELATIVE (model …) paths", variable=rel).pack(anchor="w", padx=12, pady=4)
+        out = ScrolledText(win, wrap="word", height=10); out.pack(fill="both", expand=True, padx=8, pady=8)
 
         def run_fix():
-            changed, total, mods = fix_footprint_models(fp_dir, models_root, dry_run=dry.get(), add_if_missing=add_missing.get(), prefer_ext=pref.get())
+            changed, total, mods = fix_footprint_models(fp_dir, models_root, sym_path=sym_path, dry_run=dry.get(), add_if_missing=add_missing.get(), prefer_ext=pref.get(), force_relative=rel.get())
             out.insert("end", f"{'Dry run' if dry.get() else 'Wrote'}: {changed} of {total} footprints would be/was updated.\n")
             for m in mods[:300]:
                 out.insert("end", f" - {m.name}\n")
@@ -888,9 +1096,120 @@ class App(tk.Tk):
         tk.Button(win, text="Run", command=run_fix).pack(side="left", padx=12, pady=6)
         tk.Button(win, text="Close", command=win.destroy).pack(side="right", padx=12, pady=6)
 
+    # Delete parts
+    def delete_parts_gui(self):
+        personal = Path(self.personal.get()).expanduser()
+        sym_path = self.current_sym_path()
+        fp_dir = self.current_fp_dir()
+        if not sym_path.exists():
+            messagebox.showerror("Error", f"Symbol file not found: {sym_path}"); return
+
+        win = tk.Toplevel(self); win.title("Delete Parts"); win.geometry("900x640")
+        backup = tk.BooleanVar(value=True); dry_run = tk.BooleanVar(value=True)
+        delete_fp = tk.BooleanVar(value=True); delete_3d = tk.BooleanVar(value=True); only_if_unref = tk.BooleanVar(value=True)
+
+        r = 0
+        tk.Label(win, text=f"Symbols in: {sym_path.name}").grid(row=r, column=0, columnspan=4, sticky="w", padx=8, pady=(8,4)); r += 1
+        tk.Label(win, text="Filter:").grid(row=r, column=0, sticky="e", padx=8)
+        q = tk.StringVar(); tk.Entry(win, textvariable=q, width=40).grid(row=r, column=1, sticky="w", padx=6)
+        tk.Checkbutton(win, text="Backup symbol file", variable=backup).grid(row=r, column=2, sticky="w")
+        tk.Checkbutton(win, text="Dry run", variable=dry_run).grid(row=r, column=3, sticky="w"); r += 1
+        tk.Checkbutton(win, text="Also delete referenced footprint(s)", variable=delete_fp).grid(row=r, column=0, columnspan=2, sticky="w", padx=8)
+        tk.Checkbutton(win, text="Also delete referenced 3D model file(s)", variable=delete_3d).grid(row=r, column=2, columnspan=2, sticky="w", padx=8); r += 1
+        tk.Checkbutton(win, text="Only delete FP/3D if unreferenced by remaining symbols", variable=only_if_unref).grid(row=r, column=0, columnspan=4, sticky="w", padx=8); r += 1
+
+        listbox = tk.Listbox(win, selectmode="extended"); listbox.grid(row=r, column=0, columnspan=4, sticky="nsew", padx=8, pady=6)
+        win.grid_rowconfigure(r, weight=1); win.grid_columnconfigure(1, weight=1); r += 1
+        log = ScrolledText(win, wrap="word", height=10); log.grid(row=r, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
+
+        def logprint(*a):
+            log.insert("end", " ".join(str(x) for x in a) + "\n"); log.see("end"); log.update_idletasks()
+
+        all_syms = list_symbols(sym_path)
+        def refill(*_):
+            listbox.delete(0, "end"); query = (q.get() or "").lower()
+            for name, block in sorted(all_syms, key=lambda t: t[0].lower()):
+                if query in name.lower(): listbox.insert("end", name)
+        q.trace_add("write", refill); refill()
+
+        def do_delete():
+            sel = [listbox.get(i) for i in listbox.curselection()]
+            if not sel:
+                messagebox.showwarning("Nothing selected", "Select one or more symbols to delete."); return
+            if not messagebox.askyesno("Confirm", f"Delete {len(sel)} symbol(s) from {sym_path.name}?"): return
+            keep = {}; del_blocks = {}
+            for name, block in all_syms:
+                if name in sel: del_blocks[name] = block
+                else: keep[name] = block
+
+            del_fps = set(); keep_fps = set()
+            for name, block in all_syms:
+                fp = get_symbol_footprint(block)
+                if not fp: continue
+                (del_fps if name in sel else keep_fps).add(fp)
+
+            fps_to_delete = set()
+            if delete_fp.get():
+                fps_to_delete = {fp for fp in del_fps if (fp not in keep_fps) or not only_if_unref.get()} if only_if_unref.get() else set(del_fps)
+
+            logprint(f"Will remove {len(sel)} symbol(s). Footprints considered for deletion: {len(fps_to_delete)}")
+
+            if not dry_run.get():
+                try:
+                    rebuild_symbols(sym_path, keep, backup=backup.get())
+                    logprint(f"Wrote updated symbols file with {len(keep)} remaining symbol(s).")
+                except Exception as e:
+                    messagebox.showerror("Write failed", str(e)); return
+            else:
+                logprint("[Dry run] Not writing symbols file.")
+
+            removed_fp_files = []; model_paths_to_consider = []
+            for fp in sorted(fps_to_delete):
+                mod_path = self.current_fp_dir() / f"{fp}.kicad_mod"
+                if mod_path.exists():
+                    if delete_3d.get():
+                        for mp in models_in_footprint(mod_path):
+                            model_paths_to_consider.append(mp)
+                    if not dry_run.get():
+                        try:
+                            mod_path.unlink(); removed_fp_files.append(str(mod_path)); logprint(f"Deleted footprint: {mod_path.name}")
+                        except Exception as e:
+                            logprint(f"Failed to delete footprint {mod_path.name}: {e}")
+                    else:
+                        logprint(f"[Dry run] Would delete footprint: {mod_path.name}")
+
+            removed_models = []
+            if delete_3d.get() and model_paths_to_consider:
+                still_referenced = set()
+                if only_if_unref.get():
+                    for other_mod in self.current_fp_dir().glob("*.kicad_mod"):
+                        txt = other_mod.read_text(encoding="utf-8", errors="ignore")
+                        for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt):
+                            still_referenced.add(m.group(1) or m.group(2))
+                personal_root = Path(self.personal.get()).expanduser()
+                unique_models = sorted(set(model_paths_to_consider))
+                for model_path in unique_models:
+                    if only_if_unref.get() and model_path in still_referenced: continue
+                    abs_model = expand_personal_var(model_path, personal_root)
+                    if abs_model.exists():
+                        if not dry_run.get():
+                            try:
+                                abs_model.unlink(); removed_models.append(str(abs_model)); logprint(f"Deleted 3D model: {abs_model.name}")
+                            except Exception as e:
+                                logprint(f"Failed to delete 3D model {abs_model.name}: {e}")
+                        else:
+                            logprint(f"[Dry run] Would delete 3D model: {abs_model}")
+            msg = f"Deleted symbols: {len(sel)}"
+            if delete_fp.get(): msg += f", footprints removed: {len(removed_fp_files) if not dry_run.get() else len(fps_to_delete)}"
+            if delete_3d.get(): msg += f", 3D removed: {len(removed_models) if not dry_run.get() else 'varies'}"
+            messagebox.showinfo("Done", msg); win.destroy()
+
+        btns = tk.Frame(win); btns.grid(row=r+1, column=0, columnspan=4, sticky="we", padx=8, pady=(0,8))
+        tk.Button(btns, text="Delete selected", command=do_delete).pack(side="left", padx=6)
+        tk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
+
 def main():
-    app = App()
-    app.mainloop()
+    app = App(); app.mainloop()
 
 if __name__ == "__main__":
     main()
