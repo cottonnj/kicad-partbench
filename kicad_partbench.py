@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "kicad-personal-importer-v4.2")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "kicad-personal-importer-v4.4")\n'
 NONESSENTIAL_PROPS = {"Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
                       "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
                       "Link","URL","Alt","Notes"}
@@ -384,9 +384,7 @@ def _choose_from_models(models, key, prefer="step"):
 def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_dir: Path, use_relative: bool):
 
     txt = mod_path.read_text(encoding="utf-8", errors="ignore")
-    personal_root = mod_path.parent.parent  # parent of *.pretty is personal root
-
-    # Build the path we will write
+    personal_root = mod_path.parent.parent  # .../RF_Library/{footprints.pretty,3d}
     if use_relative:
         try:
             rel = os.path.relpath(model_path, start=relative_to_dir).replace("\\\\","/")
@@ -397,8 +395,6 @@ def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_di
         sub = "step" if model_path.suffix.lower() in (".step",".stp") else "wrl"
         rel = f'${{PERSONAL_LIB_DIR}}/3d/{sub}/{model_path.name}'
         new_model_str = f'(model "{rel}")'
-
-    # Check if an equivalent model is already present (compare by filename, case-insensitive)
     existing = [mm.group(1) or mm.group(2) for mm in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
     new_key = _norm_model_key(rel, relative_to_dir, personal_root)
     for pstr in existing:
@@ -407,8 +403,6 @@ def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_di
             if cleaned != txt:
                 mod_path.write_text(cleaned, encoding="utf-8")
             return
-
-    # Append and then dedupe as a safety net
     if txt.rstrip().endswith(')'):
         txt2 = txt.rstrip()[:-1] + f"\\n  {new_model_str}\\n)"
     else:
@@ -578,7 +572,7 @@ def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Path=None, d
                 try: mod_path.rename(bak)
                 except Exception: pass
                 mod_path.write_text(new_txt, encoding="utf-8")
-        # Always collapse duplicate model entries (idempotent)
+        # Idempotent: collapse duplicate model entries
         new_txt = _dedupe_models_in_text(new_txt, fp_dir, Path(fp_dir).parent)
 
     return changed, total, modified
@@ -620,21 +614,24 @@ def expand_personal_var(path_str: str, personal_root: Path) -> Path:
         return personal_root / rest
     return Path(path_str)
 
+
 def _norm_model_key(path_str: str, fp_dir: Path, personal_root: Path) -> str:
     try:
         p = path_str.replace("\\", "/")
     except Exception:
         p = str(path_str)
     if "${PERSONAL_LIB_DIR}" in p:
-        rest = p.split("}", 1)[1].lstrip("/")
-        p = str((personal_root / rest).resolve())
+        try:
+            rest = p.split("}", 1)[1].lstrip("/")
+            p = str((personal_root / rest).resolve())
+        except Exception:
+            pass
     try:
         if not (p.startswith("/") or re.match(r'^[A-Za-z]:/', p)):
             p = str((fp_dir / p).resolve())
     except Exception:
         pass
-    key = Path(p).name.lower()
-    return key
+    return Path(p).name.lower()
 
 def _dedupe_models_in_text(txt: str, fp_dir: Path, personal_root: Path) -> str:
     models = [(m.group(0), m.group(1) or m.group(2)) for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
@@ -658,6 +655,123 @@ def _dedupe_models_in_text(txt: str, fp_dir: Path, personal_root: Path) -> str:
     else:
         base = base + insert_block
     return base
+
+
+# -------------------- PATH UTILITIES --------------------
+def _windows_kicad_config_dirs():
+    paths = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        root = Path(appdata) / "kicad"
+        if root.exists():
+            for p in root.iterdir():
+                if p.is_dir():
+                    paths.append(p)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        lroot = Path(local) / "kicad"
+        if lroot.exists():
+            for p in lroot.iterdir():
+                if p.is_dir() and p not in paths:
+                    paths.append(p)
+    return sorted(paths, key=lambda p: p.name, reverse=True)
+
+def _update_kicad_path_variable(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=print):
+    dirs = _windows_kicad_config_dirs()
+    updated = []
+    for d in dirs:
+        cfg = d / "kicad_common.json"
+        try:
+            if not cfg.exists():
+                continue
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            paths = data.get("path", {})
+            cur = paths.get(var_name)
+            new = str(personal_root)
+            if cur != new:
+                paths[var_name] = new
+                data["path"] = paths
+                cfg.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                updated.append(cfg)
+                log(f"[Paths] Set {var_name} = {new} in {cfg}")
+        except Exception as e:
+            log(f"[Paths][WARN] Failed to update {cfg}: {e}")
+    return updated
+
+def _rewrite_fp_lib_table(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=print):
+    dirs = _windows_kicad_config_dirs()
+    changed = []
+    target_abs = (personal_root / "footprints.pretty").resolve()
+    target_var = f"${{{var_name}}}/footprints.pretty"
+    pat = re.compile(r'\(uri\s+"([^"]+)"\)')
+    for d in dirs:
+        tbl = d / "fp-lib-table"
+        if not tbl.exists():
+            continue
+        txt = tbl.read_text(encoding="utf-8", errors="ignore")
+        def repl(m):
+            uri = m.group(1)
+            u_norm = uri.replace("\\\\", "/")
+            try:
+                u_path = u_norm
+                if u_path.lower().startswith("file://"):
+                    u_path = u_path[7:]
+                if Path(u_path).resolve().samefile(target_abs):
+                    return f'(uri "{target_var}")'
+            except Exception:
+                pass
+            try:
+                abs_path = Path(u_norm)
+                if str(abs_path).lower().startswith(str(personal_root.resolve()).lower()):
+                    rel = abs_path.resolve().relative_to(personal_root.resolve())
+                    return f'(uri "${{{var_name}}}/{str(rel).replace("\\\\","/")}")'
+            except Exception:
+                pass
+            return m.group(0)
+        new = pat.sub(repl, txt)
+        if new != txt:
+            tbl.write_text(new, encoding="utf-8")
+            changed.append(tbl)
+            log(f"[Paths] Rewrote URIs in {tbl}")
+    return changed
+
+def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="PERSONAL_LIB_DIR", log=print):
+    from pathlib import Path as _P
+    cnt_changed = 0
+    for mod in pretty_dir.glob("*.kicad_mod"):
+        try:
+            txt = mod.read_text(encoding="utf-8", errors="ignore")
+            def repl(m):
+                inner = m.group(1) or m.group(2)
+                s = inner.replace("\\\\","/")
+                try:
+                    p = _P(s)
+                    if not (s.startswith("${") or s.lower().startswith("file://")):
+                        rp = p
+                        if not (p.is_absolute() and p.exists()):
+                            rp = (pretty_dir / p).resolve()
+                        root = personal_root.resolve()
+                        if str(rp).lower().startswith(str(root).lower()):
+                            rel = rp.relative_to(root)
+                            return f'(model "${{{var_name}}}/{str(rel).replace("\\\\","/")}")'
+                except Exception:
+                    pass
+                return f'(model "{inner}")'
+            new_txt = re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))\s*\)', repl, txt)
+            try:
+                new_txt = _dedupe_models_in_text(new_txt, pretty_dir, personal_root)
+            except Exception:
+                pass
+            if new_txt != txt:
+                mod.write_text(new_txt, encoding="utf-8")
+                cnt_changed += 1
+        except Exception as e:
+            log(f"[Paths][WARN] Failed {mod}: {e}")
+    try:
+        os.utime(pretty_dir, None)
+    except Exception:
+        pass
+    return cnt_changed
 
 # -------------------- GUI --------------------
 class App(tk.Tk):
@@ -1213,3 +1327,42 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# NOTE: Integrate 'tab_paths' into your TabGroup if not auto-inserted.
+
+# Insert handlers inside your main GUI loop:
+
+    if event == "-SET-PATHVAR-":
+        try:
+            root = Path(values["-PERS-ROOT-"]).resolve()
+            ups = _update_kicad_path_variable(root, log=log)
+            if ups:
+                sg.popup_ok(f"Set PERSONAL_LIB_DIR in {len(ups)} KiCad config(s). Restart KiCad.", title="Done")
+            else:
+                sg.popup_ok("No KiCad configs updated (already set or not found).", title="Info")
+        except Exception as e:
+            log(f"[ERROR] {e}")
+            sg.popup_error(f"Failed to update KiCad path variable: {e}")
+
+    if event == "-REWRITE-FPLIB-":
+        try:
+            root = Path(values["-PERS-ROOT-"]).resolve()
+            ch = _rewrite_fp_lib_table(root, log=log)
+            if ch:
+                sg.popup_ok(f"Rewrote {len(ch)} fp-lib-table file(s). Reopen KiCad.", title="Done")
+            else:
+                sg.popup_ok("No changes made to fp-lib-table.", title="Info")
+        except Exception as e:
+            log(f"[ERROR] {e}")
+            sg.popup_error(f"Failed to rewrite fp-lib-table: {e}")
+
+    if event == "-REWRITE-MODELS-":
+        try:
+            root = Path(values["-PERS-ROOT-"]).resolve()
+            pdir = Path(values["-PRETTY-IN-"]).resolve()
+            n = _rewrite_models_in_pretty(pdir, root, log=log)
+            sg.popup_ok(f"Updated {n} footprint(s). Close & reopen KiCad, then Tools→Update Footprints.", title="Done")
+        except Exception as e:
+            log(f"[ERROR] {e}")
+            sg.popup_error(f"Failed to rewrite .pretty models: {e}")
+
