@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kicad Library Tool — v4.5
+# Kicad Library Tool — v4.6
 # Keeps ALL v3.9 features + v4.1 (3D root, relative paths, Delete Parts)
 # NEW in v4.2:
 #  • Import-time 3D pairing: if a package (zip/folder) contains *.kicad_mod and *.step/*.stp/*.wrl,
@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-HEADER = '(kicad_symbol_lib (version 20211014) (generator "Kicad_Library_Tool_4.5")\n'
+HEADER = '(kicad_symbol_lib (version 20211014) (generator "Kicad_Library_Tool_4.6")\n'
 NONESSENTIAL_PROPS = {"Datasheet","Description","ki_description","ki_keywords","ki_locked","Comment","Keywords",
                       "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
                       "Link","URL","Alt","Notes"}
@@ -732,7 +732,8 @@ def _rewrite_fp_lib_table(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=
                     ap = abs_path.resolve()
                     if str(ap).lower().startswith(str(root).lower()):
                         rel = ap.relative_to(root)
-                        return f'(uri "${{{var_name}}}/{str(rel).replace("\\\\","/")}")'
+                        path_rel = str(rel).replace("\\", "/")
+                        return f'(uri "${{var_name}}/{path_rel}")'
             except Exception:
                 pass
             return m.group(0)
@@ -760,7 +761,8 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
                         root = Path(personal_root).resolve()
                         if str(rp).lower().startswith(str(root).lower()):
                             rel = rp.relative_to(root)
-                            return f'(model "${{{var_name}}}/{str(rel).replace("\\\\","/")}")'
+                            path_rel = str(rel).replace("\\", "/")
+                            return f'(model "${{var_name}}/{path_rel}")'
                 except Exception:
                     pass
                 return f'(model "{inner}")'
@@ -775,7 +777,9 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
         except Exception as e:
             log(f"[Paths][WARN] Failed {mod}: {e}")
     try:
-        os.utime(pretty_dir, None)
+        pdir = Path(pretty_dir)
+        if pdir.exists():
+            os.utime(str(pdir), None)
     except Exception:
         pass
     return cnt_changed
@@ -784,8 +788,16 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Kicad Library Tool — v4.5")
-        self.geometry("1180x880")
+        self.title("Kicad Library Tool — v4.6")
+        self.geometry("1280x900")
+        self.minsize(1100, 780)
+        try:
+            self.style = ttk.Style()
+            self.style.configure("TButton", padding=6)
+            self.style.configure("TLabelframe", padding=8)
+            self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        except Exception:
+            pass
 
         self.source = tk.StringVar(); self.personal = tk.StringVar()
         self.nick = tk.StringVar(value="Personal_Footprints")
@@ -854,8 +866,44 @@ class App(tk.Tk):
 
         tk.Button(btn_row, text="Quit", command=self.destroy).pack(side="right", padx=4); r += 1
 
-        self.log = ScrolledText(self, wrap="word", height=28)
-        self.log.grid(row=r, column=0, columnspan=7, sticky="nsew", padx=8, pady=8)
+        # Logs notebook
+        log_nb = ttk.Notebook(self); self.log_nb = log_nb
+        # Summary tab
+        sum_frame = ttk.Frame(log_nb); self.sum_frame = sum_frame
+        # Counters row
+        cnt = ttk.Frame(sum_frame); cnt.pack(fill="x", padx=8, pady=6)
+        self.sum_vars = {k: tk.StringVar(value="0") for k in ("packages","new_zips","fp_added","fp_skipped","models","sym_add","sym_ren","sym_ovr","errors")}
+        def add_counter(lbl, key):
+            f = ttk.Frame(cnt); f.pack(side="left", padx=10)
+            ttk.Label(f, text=lbl).pack(anchor="w")
+            ttk.Label(f, textvariable=self.sum_vars[key], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        add_counter("Packages", "packages"); add_counter("New", "new_zips"); add_counter("FP +", "fp_added"); add_counter("FP skipped", "fp_skipped")
+        add_counter("Models", "models"); add_counter("SYM add", "sym_add"); add_counter("SYM ren", "sym_ren"); add_counter("SYM ovr", "sym_ovr"); add_counter("Errors", "errors")
+
+        # Per-package table
+        cols = ("idx","kind","name","fp+","fp-","models","sym+","ren","ovr","err","status")
+        tree = ttk.Treeview(sum_frame, columns=cols, show="headings", height=12); self.sum_tree = tree
+        hdrs = {"idx":"#","kind":"Kind","name":"Package","fp+":"FP+","fp-":"FP-","models":"Models","sym+":"SYM+","ren":"REN","ovr":"OVR","err":"ERR","status":"Status"}
+        for c in cols:
+            tree.heading(c, text=hdrs[c])
+            tree.column(c, width=80 if c!="name" else 420, anchor="center" if c!="name" else "w")
+        tree.pack(fill="both", expand=True, padx=8, pady=(0,8))
+
+        # Verbose tab
+        verb_frame = ttk.Frame(log_nb); self.verb_frame = verb_frame
+        self.log = ScrolledText(verb_frame, wrap="word", height=24); self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        # color tags
+        try:
+            self.log.tag_configure("INFO", foreground="#111111")
+            self.log.tag_configure("OK", foreground="#0b7a00")
+            self.log.tag_configure("WARN", foreground="#b36b00")
+            self.log.tag_configure("ERR", foreground="#b30000")
+            self.log.tag_configure("STEP", foreground="#004a9f")
+        except Exception: pass
+
+        log_nb.add(sum_frame, text="Summary")
+        log_nb.add(verb_frame, text="Verbose")
+        log_nb.grid(row=r, column=0, columnspan=7, sticky="nsew", padx=8, pady=8)
         self.grid_rowconfigure(r, weight=1); self.grid_columnconfigure(1, weight=1)
 
         self.results = []
@@ -948,16 +996,64 @@ class App(tk.Tk):
     # actions
     def logprint(self, *args):
         msg = " ".join(str(a) for a in args)
-        self.log.insert("end", msg + "\n"); self.log.see("end"); self.update_idletasks()
+        tag = "INFO"
+        m = msg.strip()
+        if m.startswith("ERROR") or m.startswith("ERR") or "ERROR:" in m: tag = "ERR"
+        elif m.startswith("WARN") or "[WARN]" in m: tag = "WARN"
+        elif m.startswith("== ["): tag = "STEP"
+        elif "[3D]" in m or "Paired (1:1)" in m or "Paired" in m: tag = "OK"
+        self.log.insert("end", msg + "\n", tag); self.log.see("end"); self.update_idletasks()
 
     def _count_top_level(self, sym_path: Path):
         try: raw = sym_path.read_text(encoding="utf-8", errors="ignore")
         except Exception: return 0
         return len(parse_symbol_blocks(raw))
 
+    
+    # --- Summary / Logging helpers ---
+    def _summary_begin(self):
+        # reset counters and tree
+        for k in self.sum_vars: self.sum_vars[k].set("0")
+        for i in self.sum_tree.get_children(): self.sum_tree.delete(i)
+        self._sum_tot = {"packages":0,"new_zips":0,"fp_added":0,"fp_skipped":0,"models":0,"sym_add":0,"sym_ren":0,"sym_ovr":0,"errors":0}
+
+    def _summary_add(self, idx, kind, path, res):
+        name = str(path.name if hasattr(path, "name") else path)
+        fp_plus = int(res.get("footprints_imported", 0))
+        fp_skip = int(res.get("footprints_skipped", 0))
+        models = int(res.get("models_paired", 0))
+        # symbol actions
+        sym_add = sum(1 for (_n,a,_o) in res.get("symbol_names_debug", []) if a == "ADD")
+        sym_ren = sum(1 for (_n,a,_o) in res.get("symbol_names_debug", []) if a == "RENAME")
+        sym_ovr = sum(1 for (_n,a,_o) in res.get("symbol_names_debug", []) if a == "OVERWRITE")
+        errs = len(res.get("errors", []))
+
+        self._sum_tot["packages"] += 1
+        self._sum_tot["fp_added"] += fp_plus
+        self._sum_tot["fp_skipped"] += fp_skip
+        self._sum_tot["models"] += models
+        self._sum_tot["sym_add"] += sym_add
+        self._sum_tot["sym_ren"] += sym_ren
+        self._sum_tot["sym_ovr"] += sym_ovr
+        self._sum_tot["errors"] += errs
+
+        status = "OK" if errs == 0 else f"{errs} error(s)"
+        self.sum_tree.insert("", "end", values=(idx, kind.upper(), name, fp_plus, fp_skip, models, sym_add, sym_ren, sym_ovr, errs, status))
+
+        # update counters
+        for k in self._sum_tot:
+            if k in self.sum_vars:
+                self.sum_vars[k].set(str(self._sum_tot[k]))
+
+    def _summary_finish(self):
+        # nothing heavy yet; reserved for future (e.g., save CSV)
+        pass
     def run(self):
         self.results = []
         try:
+            # initialize summary
+            self._summary_begin()
+
             src = Path(self.source.get()).expanduser()
             personal = Path(self.personal.get()).expanduser()
             sym_name = self.sym_choice.get().strip()
@@ -994,6 +1090,7 @@ class App(tk.Tk):
                     force_relative_models=self.force_relative_models.get()
                 )
                 self.results.append(res)
+                self._summary_add(idx, kind, path, res)
                 for name, action, other in res.get("symbol_names_debug", []):
                     if action == "ADD":         self.logprint("   [SYM] ADD    ", name)
                     elif action == "SKIP_DUP":  self.logprint("   [SYM] SKIP   ", name, "==", other)
@@ -1016,6 +1113,7 @@ class App(tk.Tk):
                 est = initial_count + adds
                 self.logprint(f"\nSummary (dry-run): initial {initial_count} -> estimated {est} top-level symbol(s) after this run.")
                 messagebox.showinfo("Dry run complete", f"Processed {len(pkgs)} package(s). Estimated symbols after run: {est}.")
+            self._summary_finish()
             self.logprint("Done. Reload libraries in KiCad to see updates.")
         except Exception as e:
             self.logprint("ERROR:", e); messagebox.showerror("Import failed", str(e))
@@ -1386,6 +1484,6 @@ class App(tk.Tk):
 
 def main():
     app = App(); app.mainloop()
-
+    
 if __name__ == "__main__":
     main()
