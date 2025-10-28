@@ -1121,7 +1121,7 @@ class App(tk.Tk):
         tree_frame.grid_columnconfigure(0, weight=1)
         tree_frame.grid_rowconfigure(0, weight=1)
         
-        cols = ("symbol", "footprint", "model_3d", "pins")
+        cols = ("symbol", "footprint", "mpn", "model_3d", "pins")
         self.lib_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=20)
         self.lib_tree.grid(row=0, column=0, sticky="nsew")
         
@@ -1137,18 +1137,22 @@ class App(tk.Tk):
         # Configure columns
         self.lib_tree.heading("symbol", text="Symbol Name", command=lambda: self.sort_lib_tree("symbol"))
         self.lib_tree.heading("footprint", text="Footprint", command=lambda: self.sort_lib_tree("footprint"))
+        self.lib_tree.heading("mpn", text="MPN", command=lambda: self.sort_lib_tree("mpn"))
         self.lib_tree.heading("model_3d", text="3D Model", command=lambda: self.sort_lib_tree("model_3d"))
         self.lib_tree.heading("pins", text="Pins", command=lambda: self.sort_lib_tree("pins"))
         
-        self.lib_tree.column("symbol", width=250, anchor="w")
-        self.lib_tree.column("footprint", width=300, anchor="w")
-        self.lib_tree.column("model_3d", width=200, anchor="w")
-        self.lib_tree.column("pins", width=80, anchor="center")
+        self.lib_tree.column("symbol", width=200, anchor="w")
+        self.lib_tree.column("footprint", width=220, anchor="w")
+        self.lib_tree.column("mpn", width=180, anchor="w")
+        self.lib_tree.column("model_3d", width=150, anchor="w")
+        self.lib_tree.column("pins", width=60, anchor="center")
         
         # Tool buttons at bottom
         tool_frame = ttk.Labelframe(parent, text="Library Tools", padding=12)
         tool_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(8,16))
         
+        ttk.Button(tool_frame, text="⚙️ Standardize MPN Fields", command=self.standardize_mpn_gui, style="Accent.TButton").pack(side="left", padx=4)
+        ttk.Button(tool_frame, text="🔧 Repair/Restore Library", command=self.repair_library_gui).pack(side="left", padx=4)
         ttk.Button(tool_frame, text="🔍 Audit Footprints", command=self.audit_footprints_gui).pack(side="left", padx=4)
         ttk.Button(tool_frame, text="🔧 Fix 3D Paths", command=self.fix_3d_paths_gui).pack(side="left", padx=4)
         ttk.Button(tool_frame, text="🗑️ Delete Parts", command=self.delete_parts_gui).pack(side="left", padx=4)
@@ -1632,6 +1636,24 @@ Features bug fixes and UI improvements.
                 if fp_match:
                     footprint = fp_match.group(1).split(":")[-1] if ":" in fp_match.group(1) else fp_match.group(1)
                 
+                # Extract MPN (manufacturer part number) - check various field names
+                mpn = ""
+                mpn_patterns = [
+                    r'\(property\s+"MPN"\s+"([^"]*)"',
+                    r'\(property\s+"Manufacturer_Part_Number"\s+"([^"]*)"',
+                    r'\(property\s+"Mfr Part Number"\s+"([^"]*)"',
+                    r'\(property\s+"Part Number"\s+"([^"]*)"',
+                    r'\(property\s+"PartNumber"\s+"([^"]*)"',
+                    r'\(property\s+"P/N"\s+"([^"]*)"',
+                    r'\(property\s+"Mfr_PN"\s+"([^"]*)"',
+                    r'\(property\s+"ManufacturerPartNumber"\s+"([^"]*)"',
+                ]
+                for pattern in mpn_patterns:
+                    mpn_match = re.search(pattern, block, re.IGNORECASE)
+                    if mpn_match:
+                        mpn = mpn_match.group(1)
+                        break
+                
                 # Count pins
                 pin_count = len(re.findall(r'\(pin\s+', block))
                 
@@ -1653,6 +1675,7 @@ Features bug fixes and UI improvements.
                 self.lib_data.append({
                     'symbol': name,
                     'footprint': footprint or "(none)",
+                    'mpn': mpn or "(none)",
                     'model_3d': model_3d or "(none)",
                     'pins': str(pin_count) if pin_count > 0 else "0"
                 })
@@ -1679,10 +1702,11 @@ Features bug fixes and UI improvements.
         count = 0
         
         for data in self.lib_data:
-            if not query or query in data['symbol'].lower() or query in data['footprint'].lower():
+            if not query or query in data['symbol'].lower() or query in data['footprint'].lower() or query in data['mpn'].lower():
                 self.lib_tree.insert("", "end", values=(
                     data['symbol'],
                     data['footprint'],
+                    data['mpn'],
                     data['model_3d'],
                     data['pins']
                 ))
@@ -1787,6 +1811,322 @@ Features bug fixes and UI improvements.
             return
         
         messagebox.showinfo("Delete Parts", "Delete parts tool - coming in next version")
+    
+    def repair_library_gui(self):
+        """Repair or restore library file."""
+        sym_path = self.current_sym_path()
+        
+        # Create dialog
+        win = tk.Toplevel(self)
+        win.title("Repair/Restore Library")
+        win.geometry("700x500")
+        win.configure(bg=COLORS['bg'])
+        
+        # Header
+        ttk.Label(win, text="Library Repair & Restore Tool", font=("Segoe UI", 14, "bold")).pack(pady=12)
+        
+        # Info
+        info_frame = ttk.Labelframe(win, text="Current Library", padding=12)
+        info_frame.pack(fill="x", padx=12, pady=8)
+        
+        ttk.Label(info_frame, text=f"File: {sym_path.name}").pack(anchor="w", pady=2)
+        
+        if sym_path.exists():
+            txt = sym_path.read_text(encoding="utf-8", errors="ignore")
+            syms = parse_symbol_blocks(txt)
+            ttk.Label(info_frame, text=f"Symbols found: {len(syms)}", foreground=COLORS['success']).pack(anchor="w", pady=2)
+            
+            # Check for backup
+            backup_path = sym_path.with_suffix('.kicad_sym.bak')
+            if backup_path.exists():
+                backup_txt = backup_path.read_text(encoding="utf-8", errors="ignore")
+                backup_syms = parse_symbol_blocks(backup_txt)
+                backup_time = time.ctime(backup_path.stat().st_mtime)
+                ttk.Label(info_frame, text=f"Backup available: {len(backup_syms)} symbols ({backup_time})", 
+                         foreground=COLORS['warning']).pack(anchor="w", pady=2)
+            else:
+                ttk.Label(info_frame, text="No backup found", foreground=COLORS['text_muted']).pack(anchor="w", pady=2)
+        else:
+            ttk.Label(info_frame, text="File not found!", foreground=COLORS['error']).pack(anchor="w", pady=2)
+        
+        # Options
+        opt_frame = ttk.Labelframe(win, text="Repair Options", padding=12)
+        opt_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        
+        log_text = ScrolledText(opt_frame, wrap="word", height=15, bg=COLORS['panel'], fg=COLORS['text'], font=("Consolas", 9))
+        log_text.pack(fill="both", expand=True)
+        
+        def log_msg(msg):
+            log_text.insert("end", msg + "\n")
+            log_text.see("end")
+            win.update_idletasks()
+        
+        def restore_from_backup():
+            """Restore library from backup file."""
+            backup_path = sym_path.with_suffix('.kicad_sym.bak')
+            if not backup_path.exists():
+                messagebox.showerror("Error", "No backup file found!")
+                return
+            
+            if not messagebox.askyesno("Confirm Restore", f"Restore {sym_path.name} from backup?\n\nThis will overwrite the current file."):
+                return
+            
+            try:
+                shutil.copy2(backup_path, sym_path)
+                log_msg(f"✅ Restored from backup: {backup_path.name}")
+                messagebox.showinfo("Success", "Library restored from backup!")
+                self.refresh_library_browser()
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to restore: {e}")
+        
+        def validate_and_repair():
+            """Validate library structure and repair if needed."""
+            if not sym_path.exists():
+                messagebox.showerror("Error", f"File not found: {sym_path}")
+                return
+            
+            log_msg(f"🔍 Analyzing {sym_path.name}...")
+            
+            try:
+                txt = sym_path.read_text(encoding="utf-8", errors="ignore")
+                
+                # Check header
+                if not txt.startswith("(kicad_symbol_lib"):
+                    log_msg("❌ Missing or invalid header")
+                else:
+                    log_msg("✅ Header OK")
+                
+                # Parse symbols
+                syms = parse_symbol_blocks(txt)
+                log_msg(f"✅ Found {len(syms)} symbols")
+                
+                # Check parentheses balance
+                open_count = txt.count('(')
+                close_count = txt.count(')')
+                if open_count != close_count:
+                    log_msg(f"⚠️ Parentheses mismatch: {open_count} open, {close_count} close")
+                else:
+                    log_msg(f"✅ Parentheses balanced ({open_count} pairs)")
+                
+                # Check each symbol
+                errors = []
+                for name, block in syms:
+                    # Check required fields
+                    if not re.search(r'\(property\s+"Reference"', block):
+                        errors.append(f"Symbol '{name}': Missing Reference property")
+                    if not re.search(r'\(property\s+"Value"', block):
+                        errors.append(f"Symbol '{name}': Missing Value property")
+                    
+                    # Check parentheses in block
+                    block_open = block.count('(')
+                    block_close = block.count(')')
+                    if block_open != block_close:
+                        errors.append(f"Symbol '{name}': Unbalanced parentheses ({block_open} vs {block_close})")
+                
+                if errors:
+                    log_msg(f"\n⚠️ Found {len(errors)} issues:")
+                    for err in errors[:10]:  # Show first 10
+                        log_msg(f"  • {err}")
+                    if len(errors) > 10:
+                        log_msg(f"  ... and {len(errors)-10} more")
+                else:
+                    log_msg("\n✅ Library structure is valid!")
+                    messagebox.showinfo("Validation Complete", f"Library is valid with {len(syms)} symbols")
+                
+            except Exception as e:
+                log_msg(f"❌ Error during validation: {e}")
+                messagebox.showerror("Validation Failed", str(e))
+        
+        def rebuild_library():
+            """Rebuild library file from scratch."""
+            if not messagebox.askyesno("Confirm Rebuild", "Rebuild library from parsed symbols?\n\nThis will rewrite the entire file with proper formatting."):
+                return
+            
+            log_msg("🔄 Rebuilding library...")
+            
+            try:
+                txt = sym_path.read_text(encoding="utf-8", errors="ignore")
+                syms = parse_symbol_blocks(txt)
+                
+                # Create backup
+                backup_path = sym_path.with_suffix('.kicad_sym.rebuild_bak')
+                shutil.copy2(sym_path, backup_path)
+                log_msg(f"📦 Backup created: {backup_path.name}")
+                
+                # Rebuild
+                new_content = HEADER
+                for name, block in syms:
+                    new_content += block + "\n"
+                new_content += ")\n"
+                
+                sym_path.write_text(new_content, encoding="utf-8")
+                log_msg(f"✅ Rebuilt library with {len(syms)} symbols")
+                
+                messagebox.showinfo("Success", f"Library rebuilt with {len(syms)} symbols!")
+                self.refresh_library_browser()
+                
+            except Exception as e:
+                log_msg(f"❌ Rebuild failed: {e}")
+                messagebox.showerror("Rebuild Failed", str(e))
+        
+        # Buttons
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=12)
+        
+        ttk.Button(btn_frame, text="🔍 Validate Library", command=validate_and_repair).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="🔄 Rebuild Library", command=rebuild_library).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="⏮️ Restore from Backup", command=restore_from_backup).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side="left", padx=4)
+    
+    def standardize_mpn_gui(self):
+        """Standardize MPN fields - find part numbers in various fields and move to 'MPN'."""
+        sym_path = self.current_sym_path()
+        if not sym_path.exists():
+            messagebox.showerror("Error", f"Symbol file not found: {sym_path}")
+            return
+        
+        # Create dialog
+        win = tk.Toplevel(self)
+        win.title("Standardize MPN Fields")
+        win.geometry("900x700")
+        win.configure(bg=COLORS['bg'])
+        
+        # Options
+        opt_frame = ttk.Frame(win)
+        opt_frame.pack(fill="x", padx=12, pady=12)
+        
+        dry_run = tk.BooleanVar(value=True)
+        remove_old = tk.BooleanVar(value=False)
+        
+        ttk.Checkbutton(opt_frame, text="Dry run (preview only)", variable=dry_run).pack(anchor="w", pady=4)
+        ttk.Checkbutton(opt_frame, text="Remove old field after copying to MPN", variable=remove_old).pack(anchor="w", pady=4)
+        
+        info_lbl = ttk.Label(opt_frame, text="Searches for: Manufacturer_Part_Number, Mfr Part Number, Part Number, PartNumber, P/N, etc.", 
+                            foreground=COLORS['text_muted'], wraplength=800)
+        info_lbl.pack(anchor="w", pady=8)
+        
+        # Results display
+        results_lf = ttk.Labelframe(win, text="Results", padding=12)
+        results_lf.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        
+        cols = ("symbol", "old_field", "value", "action")
+        tree = ttk.Treeview(results_lf, columns=cols, show="headings", height=20)
+        tree.pack(fill="both", expand=True, side="left")
+        
+        vsb = ttk.Scrollbar(results_lf, orient="vertical", command=tree.yview)
+        vsb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=vsb.set)
+        
+        tree.heading("symbol", text="Symbol")
+        tree.heading("old_field", text="Original Field")
+        tree.heading("value", text="Part Number")
+        tree.heading("action", text="Action")
+        
+        tree.column("symbol", width=200)
+        tree.column("old_field", width=200)
+        tree.column("value", width=250)
+        tree.column("action", width=200)
+        
+        # Summary label
+        summary_var = tk.StringVar(value="Click 'Scan' to analyze library")
+        summary_lbl = ttk.Label(win, textvariable=summary_var, foreground=COLORS['text_muted'])
+        summary_lbl.pack(pady=8)
+        
+        # Buttons
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=12)
+        
+        def scan():
+            """Scan library for parts with non-standard MPN fields."""
+            for item in tree.get_children():
+                tree.delete(item)
+            
+            summary_var.set("Scanning...")
+            win.update_idletasks()
+            
+            # Read symbol file
+            txt = sym_path.read_text(encoding="utf-8")
+            syms = list_symbols(sym_path)
+            
+            found_count = 0
+            already_mpn = 0
+            no_pn = 0
+            
+            for name, block in syms:
+                # Check if already has MPN field
+                has_mpn = bool(re.search(r'\(property\s+"MPN"\s+"([^"]*)"', block))
+                
+                # Look for other part number fields
+                mpn_patterns = {
+                    'Manufacturer_Part_Number': r'\(property\s+"Manufacturer_Part_Number"\s+"([^"]*)"',
+                    'Mfr Part Number': r'\(property\s+"Mfr Part Number"\s+"([^"]*)"',
+                    'Part Number': r'\(property\s+"Part Number"\s+"([^"]*)"',
+                    'PartNumber': r'\(property\s+"PartNumber"\s+"([^"]*)"',
+                    'P/N': r'\(property\s+"P/N"\s+"([^"]*)"',
+                    'Mfr_PN': r'\(property\s+"Mfr_PN"\s+"([^"]*)"',
+                    'ManufacturerPartNumber': r'\(property\s+"ManufacturerPartNumber"\s+"([^"]*)"',
+                }
+                
+                found = False
+                for field_name, pattern in mpn_patterns:
+                    match = re.search(pattern, block, re.IGNORECASE)
+                    if match:
+                        value = match.group(1)
+                        if value and value.strip():  # Has actual value
+                            found = True
+                            found_count += 1
+                            
+                            if has_mpn:
+                                action = "⚠️ Already has MPN (would update)"
+                                tag = "warn"
+                            else:
+                                action = "✅ Will copy to MPN"
+                                tag = "ok"
+                            
+                            tree.insert("", "end", values=(name, field_name, value, action), tags=(tag,))
+                            break
+                
+                if not found:
+                    if has_mpn:
+                        already_mpn += 1
+                    else:
+                        no_pn += 1
+            
+            tree.tag_configure("ok", foreground=COLORS['success'])
+            tree.tag_configure("warn", foreground=COLORS['warning'])
+            
+            summary_var.set(f"Found: {found_count} parts to standardize | Already OK: {already_mpn} | No part number: {no_pn}")
+        
+        def apply():
+            """Apply the standardization."""
+            if dry_run.get():
+                messagebox.showinfo("Dry Run", "Dry run mode - no changes made. Uncheck 'Dry run' to apply changes.")
+                return
+            
+            if not messagebox.askyesno("Confirm", f"Standardize MPN fields in {sym_path.name}?\n\nThis will modify your library file."):
+                return
+            
+            try:
+                changed_count = standardize_mpn_fields(
+                    sym_path, 
+                    remove_old_field=remove_old.get(),
+                    log=lambda *a: self.log_message(" ".join(str(x) for x in a), "INFO")
+                )
+                
+                messagebox.showinfo("Success", f"Updated {changed_count} symbols with MPN field")
+                self.refresh_library_browser()
+                win.destroy()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to standardize MPNs: {e}")
+        
+        ttk.Button(btn_frame, text="🔍 Scan Library", command=scan, style="Accent.TButton").pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="✅ Apply Changes", command=apply).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side="left", padx=4)
+        
+        # Auto-scan
+        win.after(100, scan)
     
     def set_kicad_var(self):
         """Set KiCad path variable."""
@@ -1911,6 +2251,107 @@ def models_in_footprint(mod_path: Path) -> List[str]:
     for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt):
         models.append(m.group(1) or m.group(2))
     return models
+
+
+def standardize_mpn_fields(sym_path: Path, remove_old_field: bool = False, log=lambda *a: None) -> int:
+    """
+    Standardize MPN fields in symbol library.
+    Finds part numbers in various field names and copies/moves them to 'MPN' field.
+    
+    Returns count of symbols changed.
+    """
+    if not sym_path.exists():
+        return 0
+    
+    # Read file
+    txt = sym_path.read_text(encoding="utf-8")
+    syms = list_symbols(sym_path)
+    
+    changed_count = 0
+    new_blocks = []
+    
+    # Field patterns to search for - just extract the value
+    mpn_patterns = [
+        ('Manufacturer_Part_Number', r'\(property\s+"Manufacturer_Part_Number"\s+"([^"]*)"'),
+        ('Mfr Part Number', r'\(property\s+"Mfr Part Number"\s+"([^"]*)"'),
+        ('Part Number', r'\(property\s+"Part Number"\s+"([^"]*)"'),
+        ('PartNumber', r'\(property\s+"PartNumber"\s+"([^"]*)"'),
+        ('P/N', r'\(property\s+"P/N"\s+"([^"]*)"'),
+        ('Mfr_PN', r'\(property\s+"Mfr_PN"\s+"([^"]*)"'),
+        ('ManufacturerPartNumber', r'\(property\s+"ManufacturerPartNumber"\s+"([^"]*)"'),
+    ]
+    
+    for name, block in syms:
+        original_block = block
+        
+        # Check if already has MPN
+        has_mpn = bool(re.search(r'\(property\s+"MPN"\s+"', block))
+        
+        # Look for other part number fields
+        for field_name, pattern in mpn_patterns:
+            match = re.search(pattern, block, re.IGNORECASE)
+            if match:
+                value = match.group(1)
+                
+                if value and value.strip():
+                    if has_mpn:
+                        # Update existing MPN value
+                        log(f"{name}: Updating MPN from {field_name} = '{value}'")
+                        block = re.sub(
+                            r'(\(property\s+"MPN"\s+)"[^"]*"',
+                            rf'\1"{value}"',
+                            block,
+                            count=1
+                        )
+                    else:
+                        # Add new MPN field - insert after Reference property
+                        log(f"{name}: Adding MPN from {field_name} = '{value}'")
+                        # Find the Reference property line to insert after
+                        ref_match = re.search(r'(\(property\s+"Reference"[^\)]+\))', block)
+                        if ref_match:
+                            insert_point = ref_match.end()
+                            mpn_property = f'\n    (property "MPN" "{value}")'
+                            block = block[:insert_point] + mpn_property + block[insert_point:]
+                        else:
+                            # Fallback: insert at beginning of symbol
+                            symbol_start = re.search(r'(\(symbol\s+"[^"]+"\s+)', block)
+                            if symbol_start:
+                                insert_point = symbol_start.end()
+                                mpn_property = f'\n    (property "MPN" "{value}")'
+                                block = block[:insert_point] + mpn_property + block[insert_point:]
+                    
+                    # Remove old field if requested
+                    if remove_old_field and field_name != "MPN":
+                        block = re.sub(pattern, '', block, flags=re.IGNORECASE)
+                        log(f"{name}: Removed old field '{field_name}'")
+                    
+                    if block != original_block:
+                        changed_count += 1
+                    
+                    break  # Only process first match
+        
+        new_blocks.append((name, block))
+    
+    # Rebuild file if changes were made
+    if changed_count > 0:
+        # Write back to file - include ALL symbols (changed and unchanged)
+        new_content = HEADER
+        for name, block in new_blocks:
+            new_content += block + "\n"
+        new_content += ")\n"
+        
+        # Backup original
+        backup_path = sym_path.with_suffix('.kicad_sym.bak')
+        shutil.copy2(sym_path, backup_path)
+        log(f"Backup created: {backup_path}")
+        
+        # Write new file
+        sym_path.write_text(new_content, encoding="utf-8")
+        log(f"Updated {changed_count} symbols in {sym_path.name}")
+    else:
+        log("No changes needed - all symbols already have MPN or no part numbers found")
+    
+    return changed_count
 
 
 def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Optional[Path] = None,
