@@ -1654,6 +1654,10 @@ Features bug fixes and UI improvements.
                         mpn = mpn_match.group(1)
                         break
                 
+                # FALLBACK: If no MPN field found, use symbol name
+                if not mpn:
+                    mpn = name  # Symbol name is often the part number
+                
                 # Count pins
                 pin_count = len(re.findall(r'\(pin\s+', block))
                 
@@ -2002,7 +2006,7 @@ Features bug fixes and UI improvements.
         ttk.Checkbutton(opt_frame, text="Dry run (preview only)", variable=dry_run).pack(anchor="w", pady=4)
         ttk.Checkbutton(opt_frame, text="Remove old field after copying to MPN", variable=remove_old).pack(anchor="w", pady=4)
         
-        info_lbl = ttk.Label(opt_frame, text="Searches for: Manufacturer_Part_Number, Mfr Part Number, Part Number, PartNumber, P/N, etc.", 
+        info_lbl = ttk.Label(opt_frame, text="Searches for: Manufacturer_Part_Number, Mfr Part Number, Part Number, PartNumber, P/N, etc.\n📝 Fallback: If no part number field found, will use Symbol Name as MPN", 
                             foreground=COLORS['text_muted'], wraplength=800)
         info_lbl.pack(anchor="w", pady=8)
         
@@ -2051,22 +2055,22 @@ Features bug fixes and UI improvements.
             
             found_count = 0
             already_mpn = 0
-            no_pn = 0
+            fallback_count = 0
             
             for name, block in syms:
                 # Check if already has MPN field
                 has_mpn = bool(re.search(r'\(property\s+"MPN"\s+"([^"]*)"', block))
                 
                 # Look for other part number fields
-                mpn_patterns = {
-                    'Manufacturer_Part_Number': r'\(property\s+"Manufacturer_Part_Number"\s+"([^"]*)"',
-                    'Mfr Part Number': r'\(property\s+"Mfr Part Number"\s+"([^"]*)"',
-                    'Part Number': r'\(property\s+"Part Number"\s+"([^"]*)"',
-                    'PartNumber': r'\(property\s+"PartNumber"\s+"([^"]*)"',
-                    'P/N': r'\(property\s+"P/N"\s+"([^"]*)"',
-                    'Mfr_PN': r'\(property\s+"Mfr_PN"\s+"([^"]*)"',
-                    'ManufacturerPartNumber': r'\(property\s+"ManufacturerPartNumber"\s+"([^"]*)"',
-                }
+                mpn_patterns = [
+                    ('Manufacturer_Part_Number', r'\(property\s+"Manufacturer_Part_Number"\s+"([^"]*)"'),
+                    ('Mfr Part Number', r'\(property\s+"Mfr Part Number"\s+"([^"]*)"'),
+                    ('Part Number', r'\(property\s+"Part Number"\s+"([^"]*)"'),
+                    ('PartNumber', r'\(property\s+"PartNumber"\s+"([^"]*)"'),
+                    ('P/N', r'\(property\s+"P/N"\s+"([^"]*)"'),
+                    ('Mfr_PN', r'\(property\s+"Mfr_PN"\s+"([^"]*)"'),
+                    ('ManufacturerPartNumber', r'\(property\s+"ManufacturerPartNumber"\s+"([^"]*)"'),
+                ]
                 
                 found = False
                 for field_name, pattern in mpn_patterns:
@@ -2087,16 +2091,20 @@ Features bug fixes and UI improvements.
                             tree.insert("", "end", values=(name, field_name, value, action), tags=(tag,))
                             break
                 
-                if not found:
-                    if has_mpn:
-                        already_mpn += 1
-                    else:
-                        no_pn += 1
+                # FALLBACK: Use symbol name if no part number found
+                if not found and not has_mpn:
+                    fallback_count += 1
+                    found_count += 1
+                    action = "📝 Will use Symbol Name"
+                    tree.insert("", "end", values=(name, "Symbol Name (fallback)", name, action), tags=("fallback",))
+                elif not found and has_mpn:
+                    already_mpn += 1
             
             tree.tag_configure("ok", foreground=COLORS['success'])
             tree.tag_configure("warn", foreground=COLORS['warning'])
+            tree.tag_configure("fallback", foreground=COLORS['text_muted'])
             
-            summary_var.set(f"Found: {found_count} parts to standardize | Already OK: {already_mpn} | No part number: {no_pn}")
+            summary_var.set(f"Found: {found_count} parts to standardize | Already OK: {already_mpn} | Using fallback: {fallback_count}")
         
         def apply():
             """Apply the standardization."""
@@ -2288,47 +2296,62 @@ def standardize_mpn_fields(sym_path: Path, remove_old_field: bool = False, log=l
         has_mpn = bool(re.search(r'\(property\s+"MPN"\s+"', block))
         
         # Look for other part number fields
+        found_value = None
+        found_field = None
+        
         for field_name, pattern in mpn_patterns:
             match = re.search(pattern, block, re.IGNORECASE)
             if match:
                 value = match.group(1)
-                
                 if value and value.strip():
-                    if has_mpn:
-                        # Update existing MPN value
-                        log(f"{name}: Updating MPN from {field_name} = '{value}'")
-                        block = re.sub(
-                            r'(\(property\s+"MPN"\s+)"[^"]*"',
-                            rf'\1"{value}"',
-                            block,
-                            count=1
-                        )
-                    else:
-                        # Add new MPN field - insert after Reference property
-                        log(f"{name}: Adding MPN from {field_name} = '{value}'")
-                        # Find the Reference property line to insert after
-                        ref_match = re.search(r'(\(property\s+"Reference"[^\)]+\))', block)
-                        if ref_match:
-                            insert_point = ref_match.end()
-                            mpn_property = f'\n    (property "MPN" "{value}")'
-                            block = block[:insert_point] + mpn_property + block[insert_point:]
-                        else:
-                            # Fallback: insert at beginning of symbol
-                            symbol_start = re.search(r'(\(symbol\s+"[^"]+"\s+)', block)
-                            if symbol_start:
-                                insert_point = symbol_start.end()
-                                mpn_property = f'\n    (property "MPN" "{value}")'
-                                block = block[:insert_point] + mpn_property + block[insert_point:]
-                    
-                    # Remove old field if requested
-                    if remove_old_field and field_name != "MPN":
-                        block = re.sub(pattern, '', block, flags=re.IGNORECASE)
-                        log(f"{name}: Removed old field '{field_name}'")
-                    
-                    if block != original_block:
-                        changed_count += 1
-                    
-                    break  # Only process first match
+                    found_value = value
+                    found_field = field_name
+                    break  # Found a part number
+        
+        # FALLBACK: If no part number field found, use symbol name
+        if not found_value and not has_mpn:
+            found_value = name
+            found_field = "Symbol Name (fallback)"
+        
+        # Apply the value if we found one
+        if found_value:
+            if has_mpn:
+                # Update existing MPN value
+                log(f"{name}: Updating MPN from {found_field} = '{found_value}'")
+                block = re.sub(
+                    r'(\(property\s+"MPN"\s+)"[^"]*"',
+                    rf'\1"{found_value}"',
+                    block,
+                    count=1
+                )
+            else:
+                # Add new MPN field - insert after Reference property
+                log(f"{name}: Adding MPN from {found_field} = '{found_value}'")
+                # Find the Reference property line to insert after
+                ref_match = re.search(r'(\(property\s+"Reference"[^\)]+\))', block)
+                if ref_match:
+                    insert_point = ref_match.end()
+                    mpn_property = f'\n    (property "MPN" "{found_value}")'
+                    block = block[:insert_point] + mpn_property + block[insert_point:]
+                else:
+                    # Fallback: insert at beginning of symbol
+                    symbol_start = re.search(r'(\(symbol\s+"[^"]+"\s+)', block)
+                    if symbol_start:
+                        insert_point = symbol_start.end()
+                        mpn_property = f'\n    (property "MPN" "{found_value}")'
+                        block = block[:insert_point] + mpn_property + block[insert_point:]
+            
+            # Remove old field if requested (not for symbol name fallback)
+            if remove_old_field and found_field != "Symbol Name (fallback)" and found_field != "MPN":
+                # Find the original pattern for this field
+                for fname, fpat in mpn_patterns:
+                    if fname == found_field:
+                        block = re.sub(fpat, '', block, flags=re.IGNORECASE)
+                        log(f"{name}: Removed old field '{found_field}'")
+                        break
+            
+            if block != original_block:
+                changed_count += 1
         
         new_blocks.append((name, block))
     
