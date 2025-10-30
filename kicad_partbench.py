@@ -1009,16 +1009,19 @@ class App(tk.Tk):
         # Create tabs
         tab_import = ttk.Frame(notebook)
         tab_library = ttk.Frame(notebook)
+        tab_bom = ttk.Frame(notebook)
         tab_settings = ttk.Frame(notebook)
         tab_results = ttk.Frame(notebook)
         
         notebook.add(tab_import, text=" 📁 Import ")
         notebook.add(tab_library, text=" 📚 Library ")
+        notebook.add(tab_bom, text=" 📋 BOM Manager ")
         notebook.add(tab_settings, text=" ⚙️ Settings ")
         notebook.add(tab_results, text=" 📊 Results ")
         
         self._create_import_tab(tab_import)
         self._create_library_tab(tab_library)
+        self._create_bom_manager_tab(tab_bom)
         self._create_settings_tab(tab_settings)
         self._create_results_tab(tab_results)
         
@@ -1163,6 +1166,84 @@ class App(tk.Tk):
         # Auto-load if library path is set
         if self.personal.get():
             self.after(100, self.refresh_library_browser)
+    
+    def _create_bom_manager_tab(self, parent):
+        """Create BOM Manager tab for importing Octopart BOMs and updating schematics."""
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+        
+        # File selection section
+        file_frame = ttk.Labelframe(parent, text="1. Select Files", padding=12)
+        file_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
+        file_frame.grid_columnconfigure(1, weight=1)
+        
+        # Octopart BOM file
+        ttk.Label(file_frame, text="Octopart BOM:").grid(row=0, column=0, sticky="w", padx=(0,8), pady=4)
+        self.bom_file_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.bom_file_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(file_frame, text="📁 Browse", command=self.browse_bom_file).grid(row=0, column=2, padx=4, pady=4)
+        
+        # KiCad schematic file
+        ttk.Label(file_frame, text="KiCad Schematic:").grid(row=1, column=0, sticky="w", padx=(0,8), pady=4)
+        self.sch_file_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.sch_file_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(file_frame, text="📁 Browse", command=self.browse_sch_file).grid(row=1, column=2, padx=4, pady=4)
+        
+        # Load button
+        btn_load = ttk.Button(file_frame, text="🔄 Load & Analyze", command=self.load_bom_files, style="Accent.TButton")
+        btn_load.grid(row=2, column=0, columnspan=3, pady=(8,0))
+        
+        # Status section
+        status_frame = ttk.Frame(parent)
+        status_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        self.bom_status_var = tk.StringVar(value="Select files and click 'Load & Analyze' to begin...")
+        ttk.Label(status_frame, textvariable=self.bom_status_var, foreground=COLORS['text_muted']).pack(side="left")
+        
+        # Preview tree
+        preview_frame = ttk.Labelframe(parent, text="2. Preview Changes", padding=12)
+        preview_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=8)
+        preview_frame.grid_columnconfigure(0, weight=1)
+        preview_frame.grid_rowconfigure(0, weight=1)
+        
+        cols = ("ref", "value", "footprint", "current_mpn", "new_mpn", "action", "file")
+        self.bom_tree = ttk.Treeview(preview_frame, columns=cols, show="headings", height=15)
+        self.bom_tree.grid(row=0, column=0, sticky="nsew")
+        
+        # Scrollbars
+        vsb = ttk.Scrollbar(preview_frame, orient="vertical", command=self.bom_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.bom_tree.configure(yscrollcommand=vsb.set)
+        
+        hsb = ttk.Scrollbar(preview_frame, orient="horizontal", command=self.bom_tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.bom_tree.configure(xscrollcommand=hsb.set)
+        
+        # Configure columns
+        self.bom_tree.heading("ref", text="Reference")
+        self.bom_tree.heading("value", text="Value")
+        self.bom_tree.heading("footprint", text="Footprint")
+        self.bom_tree.heading("current_mpn", text="Current MPN")
+        self.bom_tree.heading("new_mpn", text="New MPN")
+        self.bom_tree.heading("action", text="Action")
+        self.bom_tree.heading("file", text="File")
+        
+        self.bom_tree.column("ref", width=100, anchor="w")
+        self.bom_tree.column("value", width=100, anchor="w")
+        self.bom_tree.column("footprint", width=180, anchor="w")
+        self.bom_tree.column("current_mpn", width=150, anchor="w")
+        self.bom_tree.column("new_mpn", width=150, anchor="w")
+        self.bom_tree.column("action", width=100, anchor="center")
+        self.bom_tree.column("file", width=150, anchor="w")
+        
+        # Action buttons
+        action_frame = ttk.Frame(parent)
+        action_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(8,16))
+        
+        self.bom_summary_var = tk.StringVar(value="")
+        ttk.Label(action_frame, textvariable=self.bom_summary_var, foreground=COLORS['text_muted']).pack(side="left", padx=8)
+        
+        ttk.Button(action_frame, text="✅ Apply to Schematics", command=self.apply_bom_updates, style="Accent.TButton").pack(side="right", padx=4)
+        ttk.Button(action_frame, text="📤 Export Preview CSV", command=self.export_bom_preview).pack(side="right", padx=4)
     
     def _create_settings_tab(self, parent):
         """Create settings tab."""
@@ -1983,6 +2064,205 @@ Features bug fixes and UI improvements.
         ttk.Button(btn_frame, text="⏮️ Restore from Backup", command=restore_from_backup).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side="left", padx=4)
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BOM MANAGER METHODS
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def browse_bom_file(self):
+        """Browse for Octopart BOM file."""
+        filename = filedialog.askopenfilename(
+            title="Select Octopart BOM",
+            filetypes=[
+                ("Excel files", "*.xlsx"),
+                ("CSV files", "*.csv"),
+                ("All files", "*.*")
+            ]
+        )
+        if filename:
+            self.bom_file_var.set(filename)
+    
+    def browse_sch_file(self):
+        """Browse for KiCad schematic file."""
+        filename = filedialog.askopenfilename(
+            title="Select KiCad Schematic (main file)",
+            filetypes=[
+                ("KiCad Schematic", "*.kicad_sch"),
+                ("KiCad Project", "*.kicad_pro"),
+                ("All files", "*.*")
+            ]
+        )
+        if filename:
+            self.sch_file_var.set(filename)
+    
+    def load_bom_files(self):
+        """Load and analyze BOM and schematic files."""
+        bom_file = self.bom_file_var.get()
+        sch_file = self.sch_file_var.get()
+        
+        if not bom_file or not sch_file:
+            messagebox.showerror("Error", "Please select both BOM and schematic files")
+            return
+        
+        self.bom_status_var.set("Loading files...")
+        self.update_idletasks()
+        
+        # Clear tree
+        for item in self.bom_tree.get_children():
+            self.bom_tree.delete(item)
+        
+        try:
+            # Parse Octopart BOM
+            self.bom_status_var.set("Parsing Octopart BOM...")
+            self.update_idletasks()
+            bom_data = parse_octopart_bom(Path(bom_file))
+            
+            # Parse KiCad schematics (including hierarchical sheets)
+            self.bom_status_var.set("Parsing KiCad schematics...")
+            self.update_idletasks()
+            sch_data = parse_kicad_project(Path(sch_file))
+            
+            # Match and preview
+            self.bom_status_var.set("Matching components...")
+            self.update_idletasks()
+            self.bom_matches = match_bom_to_schematic(bom_data, sch_data)
+            
+            # Populate tree
+            add_count = 0
+            update_count = 0
+            ok_count = 0
+            missing_count = 0
+            
+            for match in self.bom_matches:
+                if match['status'] == 'add':
+                    tag = 'add'
+                    action = '✅ Add MPN'
+                    add_count += 1
+                elif match['status'] == 'update':
+                    tag = 'update'
+                    action = '⚠️ Update'
+                    update_count += 1
+                elif match['status'] == 'ok':
+                    tag = 'ok'
+                    action = '✓ OK'
+                    ok_count += 1
+                elif match['status'] == 'missing':
+                    tag = 'missing'
+                    action = '❌ Not found'
+                    missing_count += 1
+                else:
+                    tag = ''
+                    action = match['status']
+                
+                self.bom_tree.insert("", "end", values=(
+                    match['ref'],
+                    match.get('value', ''),
+                    match.get('footprint', ''),
+                    match.get('current_mpn', '(none)'),
+                    match.get('new_mpn', ''),
+                    action,
+                    Path(match.get('file', '')).name if match.get('file') else ''
+                ), tags=(tag,))
+            
+            # Configure tags
+            self.bom_tree.tag_configure('add', foreground=COLORS['success'])
+            self.bom_tree.tag_configure('update', foreground=COLORS['warning'])
+            self.bom_tree.tag_configure('ok', foreground=COLORS['text_muted'])
+            self.bom_tree.tag_configure('missing', foreground=COLORS['error'])
+            
+            # Update summary
+            total = len(self.bom_matches)
+            files_count = len(set(m.get('file') for m in self.bom_matches if m.get('file')))
+            
+            summary = f"Found {total} components in {files_count} file(s): "
+            summary += f"{add_count} to add, {update_count} to update, {ok_count} OK"
+            if missing_count > 0:
+                summary += f", {missing_count} not found"
+            self.bom_summary_var.set(summary)
+            
+            if missing_count > 0:
+                self.bom_status_var.set(f"⚠️ Warning: {missing_count} components in BOM not found in schematic")
+            else:
+                self.bom_status_var.set(f"✅ Analysis complete! Ready to apply changes.")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load files:\n\n{e}")
+            self.bom_status_var.set(f"❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def apply_bom_updates(self):
+        """Apply BOM updates to schematic files."""
+        if not hasattr(self, 'bom_matches') or not self.bom_matches:
+            messagebox.showerror("Error", "No changes to apply. Load files first.")
+            return
+        
+        # Count changes
+        to_apply = [m for m in self.bom_matches if m['status'] in ('add', 'update')]
+        
+        if not to_apply:
+            messagebox.showinfo("No Changes", "No changes to apply. All components are up to date.")
+            return
+        
+        if not messagebox.askyesno("Confirm", 
+            f"Apply {len(to_apply)} changes to schematic files?\n\n"
+            "Backups will be created with .bak extension."):
+            return
+        
+        try:
+            self.bom_status_var.set("Applying changes...")
+            self.update_idletasks()
+            
+            result = apply_bom_to_schematics(self.bom_matches)
+            
+            messagebox.showinfo("Success", 
+                f"Updated {result['updated']} components in {result['files_modified']} file(s)\n\n"
+                f"Backups created with .bak extension")
+            
+            self.bom_status_var.set(f"✅ Applied {result['updated']} changes successfully!")
+            
+            # Reload to show current state
+            self.load_bom_files()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply changes:\n\n{e}")
+            import traceback
+            traceback.print_exc()
+    
+    def export_bom_preview(self):
+        """Export preview to CSV."""
+        if not hasattr(self, 'bom_matches') or not self.bom_matches:
+            messagebox.showerror("Error", "No data to export. Load files first.")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            title="Export Preview",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            import csv
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Reference', 'Value', 'Footprint', 'Current MPN', 'New MPN', 'Action', 'File'])
+                for match in self.bom_matches:
+                    writer.writerow([
+                        match['ref'],
+                        match.get('value', ''),
+                        match.get('footprint', ''),
+                        match.get('current_mpn', ''),
+                        match.get('new_mpn', ''),
+                        match['status'],
+                        Path(match.get('file', '')).name if match.get('file') else ''
+                    ])
+            
+            messagebox.showinfo("Success", f"Exported to:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export:\n\n{e}")
+    
     def standardize_mpn_gui(self):
         """Standardize MPN fields - find part numbers in various fields and move to 'MPN'."""
         sym_path = self.current_sym_path()
@@ -2471,6 +2751,517 @@ def _rewrite_models(personal_root: Path, log=lambda *a: None) -> int:
     # Simplified for now
     log("Model path rewrite not yet implemented")
     return count
+
+
+def _col_to_index(col: str) -> int:
+    """Convert Excel column letter to index (A=1, B=2, ..., Z=26, AA=27)."""
+    result = 0
+    for i, char in enumerate(reversed(col)):
+        result += (ord(char) - ord('A') + 1) * (26 ** i)
+    return result
+
+
+def _find_matching_paren(text: str, start: int) -> int:
+    """
+    Find the matching closing parenthesis for an opening paren at position start.
+    Returns the index of the matching closing paren.
+    """
+    if text[start] != '(':
+        return -1
+    
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BOM MANAGER HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_octopart_bom(bom_path: Path) -> List[dict]:
+    """
+    Parse Octopart BOM from Excel or CSV.
+    Returns list of components with flexible column name recognition.
+    Uses fallback method for Excel files to avoid openpyxl compatibility issues.
+    """
+    # For CSV, use pandas
+    if bom_path.suffix.lower() == '.csv':
+        import pandas as pd
+        df = pd.read_csv(bom_path)
+        data = df.to_dict('records')
+        headers = list(df.columns)
+    else:
+        # For Excel, read XML directly to avoid openpyxl bugs
+        import zipfile
+        import xml.etree.ElementTree as ET
+        
+        with zipfile.ZipFile(bom_path, 'r') as zip_ref:
+            # Read shared strings
+            shared_strings = []
+            try:
+                with zip_ref.open('xl/sharedStrings.xml') as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    for si in root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si'):
+                        t = si.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t')
+                        if t is not None:
+                            shared_strings.append(t.text if t.text else '')
+            except:
+                pass
+            
+            # Read first sheet
+            with zip_ref.open('xl/worksheets/sheet1.xml') as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                
+                rows_data = []
+                for row_elem in root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
+                    cells = {}
+                    for cell in row_elem.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
+                        cell_ref = cell.get('r')
+                        col = ''.join(c for c in cell_ref if c.isalpha())
+                        
+                        v = cell.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
+                        if v is not None:
+                            cell_type = cell.get('t')
+                            if cell_type == 's':
+                                try:
+                                    cells[col] = shared_strings[int(v.text)]
+                                except:
+                                    cells[col] = v.text
+                            else:
+                                cells[col] = v.text
+                        else:
+                            cells[col] = ''
+                    
+                    rows_data.append(cells)
+                
+                # Convert to list of dicts with proper column names
+                if not rows_data:
+                    raise ValueError("No data found in Excel file")
+                
+                # First row is headers
+                header_row = rows_data[0]
+                sorted_headers = sorted(header_row.items(), key=lambda x: _col_to_index(x[0]))
+                headers = [val for col, val in sorted_headers]
+                
+                # Data rows
+                data = []
+                for row_dict in rows_data[1:]:
+                    row_data = {}
+                    for col, header in zip([c for c, _ in sorted_headers], headers):
+                        row_data[header] = row_dict.get(col, '')
+                    data.append(row_data)
+    
+    # Flexible column name mapping (case-insensitive)
+    col_map = {}
+    for col in headers:
+        col_lower = str(col).lower().strip()
+        
+        # Reference column
+        if col_lower in ['reference', 'designator', 'ref', 'designators', 'part references']:
+            col_map['reference'] = col
+        
+        # MPN column
+        elif col_lower in ['matched part number', 'mpn', 'part number', 'manufacturer part number', 
+                          'mfr part number', 'partnumber', 'mfr_pn']:
+            col_map['mpn'] = col
+        
+        # Value column
+        elif col_lower in ['value', 'component value', 'part value']:
+            col_map['value'] = col
+        
+        # Footprint column
+        elif col_lower in ['footprint', 'package', 'footprint name', 'pcb footprint']:
+            col_map['footprint'] = col
+        
+        # Manufacturer column
+        elif col_lower in ['matched manufacturer', 'manufacturer', 'mfr', 'manufacturer name']:
+            col_map['manufacturer'] = col
+        
+        # Datasheet column
+        elif col_lower in ['datasheet', 'datasheet link', 'datasheet url']:
+            col_map['datasheet'] = col
+        
+        # Description column
+        elif col_lower in ['description', 'part description', 'component description']:
+            col_map['description'] = col
+    
+    # Check required columns
+    if 'reference' not in col_map:
+        raise ValueError(f"Required column 'Reference' (or 'Designator', 'Ref') not found in BOM. Available columns: {headers}")
+    if 'mpn' not in col_map:
+        raise ValueError(f"Required column 'Matched Part Number' (or 'MPN', 'Part Number') not found in BOM. Available columns: {headers}")
+    
+    # Parse rows
+    components = []
+    for row in data:
+        ref_str = str(row.get(col_map['reference'], '')).strip()
+        mpn = str(row.get(col_map['mpn'], '')).strip()
+        
+        if not ref_str or ref_str.lower() in ['nan', 'none', '']:
+            continue
+        
+        # Split multiple references (e.g., "C1, C9, C18, C31")
+        refs = [r.strip() for r in ref_str.replace(',', ' ').split() if r.strip()]
+        
+        for ref in refs:
+            comp = {
+                'ref': ref,
+                'mpn': mpn if mpn.lower() not in ['nan', 'none', ''] else '',
+                'value': str(row.get(col_map['value'], '')).strip() if 'value' in col_map else '',
+                'footprint': str(row.get(col_map['footprint'], '')).strip() if 'footprint' in col_map else '',
+                'manufacturer': str(row.get(col_map['manufacturer'], '')).strip() if 'manufacturer' in col_map else '',
+                'datasheet': str(row.get(col_map['datasheet'], '')).strip() if 'datasheet' in col_map else '',
+                'description': str(row.get(col_map['description'], '')).strip() if 'description' in col_map else '',
+            }
+            components.append(comp)
+    
+    return components
+
+
+def parse_kicad_schematic(sch_path: Path) -> dict:
+    """
+    Parse a single KiCad schematic file.
+    Returns dict with components and sub-sheet references.
+    """
+    if not sch_path.exists():
+        return {'components': [], 'sheets': []}
+    
+    text = sch_path.read_text(encoding='utf-8')
+    
+    components = []
+    sheets = []
+    
+    # Find all component symbols
+    # Pattern: (symbol ... (property "Reference" "C1") ... )
+    i = 0
+    while True:
+        # Find next symbol
+        i = text.find('\n\t(symbol\n', i)
+        if i == -1:
+            break
+        
+        # Find matching closing paren
+        depth = 0
+        start = i + 1
+        j = start
+        while j < len(text):
+            if text[j] == '(':
+                depth += 1
+            elif text[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        
+        symbol_block = text[start:j+1]
+        
+        # Extract properties
+        ref = re.search(r'\(property "Reference" "([^"]+)"', symbol_block)
+        value = re.search(r'\(property "Value" "([^"]+)"', symbol_block)
+        footprint = re.search(r'\(property "Footprint" "([^"]+)"', symbol_block)
+        mpn = re.search(r'\(property "MPN" "([^"]+)"', symbol_block)
+        
+        if ref:
+            comp = {
+                'ref': ref.group(1),
+                'value': value.group(1) if value else '',
+                'footprint': footprint.group(1) if footprint else '',
+                'mpn': mpn.group(1) if mpn else '',
+                'block': symbol_block,
+                'start': start,
+                'end': j+1
+            }
+            components.append(comp)
+        
+        i = j + 1
+    
+    # Find sub-sheets
+    # Pattern: (sheet ... (property "Sheetfile" "CM5_GPIO.kicad_sch") ... )
+    for match in re.finditer(r'\(property "Sheetfile" "([^"]+)"', text):
+        sheets.append(match.group(1))
+    
+    return {'components': components, 'sheets': sheets, 'file': sch_path}
+
+
+def parse_kicad_project(entry_file: Path) -> dict:
+    """
+    Parse KiCad project starting from main schematic or project file.
+    Recursively processes hierarchical sheets.
+    Returns dict with all components from all sheets.
+    """
+    # If .kicad_pro, extract schematic path
+    if entry_file.suffix == '.kicad_pro':
+        import json
+        proj_data = json.loads(entry_file.read_text(encoding='utf-8'))
+        sch_name = proj_data.get('schematic', entry_file.stem + '.kicad_sch')
+        entry_file = entry_file.parent / sch_name
+    
+    all_files = {}
+    to_process = [entry_file]
+    processed = set()
+    
+    while to_process:
+        sch_file = to_process.pop(0)
+        
+        if sch_file in processed:
+            continue
+        processed.add(sch_file)
+        
+        data = parse_kicad_schematic(sch_file)
+        all_files[str(sch_file)] = data
+        
+        # Add sub-sheets to process
+        for sheet_name in data['sheets']:
+            sheet_path = sch_file.parent / sheet_name
+            if sheet_path.exists() and sheet_path not in processed:
+                to_process.append(sheet_path)
+    
+    return all_files
+
+
+def match_bom_to_schematic(bom_data: List[dict], sch_data: dict) -> List[dict]:
+    """
+    Match BOM components to schematic components.
+    Returns list of matches with status (add/update/ok/missing).
+    """
+    # Build lookup of all schematic components
+    sch_lookup = {}
+    for file_path, file_data in sch_data.items():
+        for comp in file_data['components']:
+            sch_lookup[comp['ref']] = {
+                'value': comp['value'],
+                'footprint': comp['footprint'],
+                'current_mpn': comp['mpn'],
+                'file': file_path,
+                'comp_data': comp
+            }
+    
+    # Match BOM to schematic
+    matches = []
+    for bom_comp in bom_data:
+        ref = bom_comp['ref']
+        new_mpn = bom_comp['mpn']
+        
+        if ref in sch_lookup:
+            sch_comp = sch_lookup[ref]
+            current_mpn = sch_comp['current_mpn']
+            
+            if not current_mpn and new_mpn:
+                status = 'add'
+            elif current_mpn and new_mpn and current_mpn != new_mpn:
+                status = 'update'
+            elif current_mpn == new_mpn:
+                status = 'ok'
+            else:
+                status = 'unknown'
+            
+            matches.append({
+                'ref': ref,
+                'value': sch_comp['value'],
+                'footprint': sch_comp['footprint'],
+                'current_mpn': current_mpn,
+                'new_mpn': new_mpn,
+                'manufacturer': bom_comp.get('manufacturer', ''),
+                'datasheet': bom_comp.get('datasheet', ''),
+                'description': bom_comp.get('description', ''),
+                'status': status,
+                'file': sch_comp['file'],
+                'comp_data': sch_comp['comp_data']
+            })
+        else:
+            # In BOM but not in schematic
+            matches.append({
+                'ref': ref,
+                'value': bom_comp.get('value', ''),
+                'footprint': bom_comp.get('footprint', ''),
+                'current_mpn': '',
+                'new_mpn': new_mpn,
+                'status': 'missing',
+                'file': ''
+            })
+    
+    return matches
+
+
+def apply_bom_to_schematics(matches: List[dict]) -> dict:
+    """
+    Apply BOM updates to schematic files.
+    Creates backups and updates MPN properties.
+    """
+    files_to_update = {}
+    
+    # Group by file
+    for match in matches:
+        if match['status'] not in ('add', 'update'):
+            continue
+        
+        file = match.get('file')
+        if not file:
+            continue
+        
+        if file not in files_to_update:
+            files_to_update[file] = []
+        files_to_update[file].append(match)
+    
+    updated_count = 0
+    
+    for file_path, updates in files_to_update.items():
+        sch_path = Path(file_path)
+        
+        # Create backup
+        backup_path = sch_path.with_suffix('.kicad_sch.bak')
+        shutil.copy2(sch_path, backup_path)
+        
+        # Read file
+        text = sch_path.read_text(encoding='utf-8')
+        
+        # Apply updates
+        for update in updates:
+            comp_data = update['comp_data']
+            new_mpn = update['new_mpn']
+            
+            symbol_block = comp_data['block']
+            
+            if update['status'] == 'add':
+                # Add MPN, Manufacturer, Datasheet, Description properties after Reference
+                # Find the Reference property with proper paren matching
+                ref_start = symbol_block.find('(property "Reference"')
+                if ref_start != -1:
+                    # Find the matching closing paren for this property
+                    ref_end = _find_matching_paren(symbol_block, ref_start)
+                    if ref_end != -1:
+                        insert_point = ref_end + 1  # Insert after the closing )
+                        
+                        # Build properties to add
+                        props_to_add = []
+                        
+                        # MPN
+                        new_mpn = update['new_mpn']
+                        if new_mpn:
+                            props_to_add.append(f'\n\t\t\t(property "MPN" "{new_mpn}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)')
+                        
+                        # Manufacturer
+                        manufacturer = update.get('manufacturer', '')
+                        if manufacturer:
+                            props_to_add.append(f'\n\t\t\t(property "Manufacturer" "{manufacturer}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)')
+                        
+                        # Datasheet - Only if we have it and it's not already there
+                        datasheet = update.get('datasheet', '')
+                        if datasheet and datasheet.lower() not in ['nan', 'none', '~']:
+                            if '(property "Datasheet"' not in symbol_block:
+                                props_to_add.append(f'\n\t\t\t(property "Datasheet" "{datasheet}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)')
+                        
+                        # Description - Only if we have it and it's not already there  
+                        description = update.get('description', '')
+                        if description and description.lower() not in ['nan', 'none']:
+                            if '(property "Description"' not in symbol_block:
+                                # Escape quotes in description
+                                description = description.replace('"', '\\"')
+                                props_to_add.append(f'\n\t\t\t(property "Description" "{description}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)')
+                        
+                        # Add all properties
+                        if props_to_add:
+                            new_block = symbol_block[:insert_point] + ''.join(props_to_add) + symbol_block[insert_point:]
+                            text = text.replace(symbol_block, new_block)
+                            updated_count += 1
+            
+            elif update['status'] == 'update':
+                # Update existing MPN, Manufacturer, Datasheet, Description
+                new_block = symbol_block
+                
+                # Update MPN value
+                new_mpn = update['new_mpn']
+                if new_mpn:
+                    if '(property "MPN"' in new_block:
+                        # Find and update the MPN value
+                        mpn_start = new_block.find('(property "MPN" "')
+                        if mpn_start != -1:
+                            value_start = mpn_start + len('(property "MPN" "')
+                            value_end = new_block.find('"', value_start)
+                            if value_end != -1:
+                                new_block = new_block[:value_start] + new_mpn + new_block[value_end:]
+                    else:
+                        # Add if not present - find Reference property end
+                        ref_start = new_block.find('(property "Reference"')
+                        if ref_start != -1:
+                            ref_end = _find_matching_paren(new_block, ref_start)
+                            if ref_end != -1:
+                                insert_point = ref_end + 1
+                                mpn_prop = f'\n\t\t\t(property "MPN" "{new_mpn}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)'
+                                new_block = new_block[:insert_point] + mpn_prop + new_block[insert_point:]
+                
+                # Update Manufacturer
+                manufacturer = update.get('manufacturer', '')
+                if manufacturer:
+                    if '(property "Manufacturer"' in new_block:
+                        # Find and update the Manufacturer value
+                        mfr_start = new_block.find('(property "Manufacturer" "')
+                        if mfr_start != -1:
+                            value_start = mfr_start + len('(property "Manufacturer" "')
+                            value_end = new_block.find('"', value_start)
+                            if value_end != -1:
+                                new_block = new_block[:value_start] + manufacturer + new_block[value_end:]
+                    else:
+                        # Add after MPN if it exists
+                        mpn_start = new_block.find('(property "MPN"')
+                        if mpn_start != -1:
+                            mpn_end = _find_matching_paren(new_block, mpn_start)
+                            if mpn_end != -1:
+                                insert_point = mpn_end + 1
+                                mfr_prop = f'\n\t\t\t(property "Manufacturer" "{manufacturer}"\n\t\t\t\t(at 0 0 0)\n\t\t\t\t(effects\n\t\t\t\t\t(font\n\t\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t\t)\n\t\t\t\t\t(hide yes)\n\t\t\t\t)\n\t\t\t)'
+                                new_block = new_block[:insert_point] + mfr_prop + new_block[insert_point:]
+                
+                # Update Datasheet value (don't overwrite if already exists)
+                datasheet = update.get('datasheet', '')
+                if datasheet and datasheet.lower() not in ['nan', 'none', '~']:
+                    if '(property "Datasheet"' in new_block:
+                        # Check if current is just ~ or empty
+                        ds_start = new_block.find('(property "Datasheet" "')
+                        if ds_start != -1:
+                            value_start = ds_start + len('(property "Datasheet" "')
+                            value_end = new_block.find('"', value_start)
+                            if value_end != -1:
+                                current_value = new_block[value_start:value_end]
+                                if current_value in ['~', '']:
+                                    new_block = new_block[:value_start] + datasheet + new_block[value_end:]
+                
+                # Update Description value (don't overwrite if already exists)
+                description = update.get('description', '')
+                if description and description.lower() not in ['nan', 'none']:
+                    description = description.replace('"', '\\"')
+                    if '(property "Description"' in new_block:
+                        # Only update if current is generic
+                        desc_start = new_block.find('(property "Description" "')
+                        if desc_start != -1:
+                            value_start = desc_start + len('(property "Description" "')
+                            value_end = new_block.find('"', value_start)
+                            if value_end != -1:
+                                current_value = new_block[value_start:value_end]
+                                # Only overwrite if it's a generic description
+                                if current_value in ['Unpolarized capacitor', 'Resistor', '']:
+                                    new_block = new_block[:value_start] + description + new_block[value_end:]
+                
+                if new_block != symbol_block:
+                    text = text.replace(symbol_block, new_block)
+                    updated_count += 1
+        
+        # Write updated file
+        sch_path.write_text(text, encoding='utf-8')
+    
+    return {
+        'updated': updated_count,
+        'files_modified': len(files_to_update)
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
