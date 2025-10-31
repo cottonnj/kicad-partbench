@@ -1852,7 +1852,7 @@ Features bug fixes and UI improvements.
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=8)
     
     def fix_3d_paths_gui(self):
-        """Fix 3D model paths in footprints."""
+        """Fix 3D model paths in footprints - Enhanced with selective updating."""
         fp_dir = self.current_fp_dir()
         models_root = self.current_models_root()
         sym_path = self.current_sym_path()
@@ -1862,31 +1862,219 @@ Features bug fixes and UI improvements.
             return
         
         win = tk.Toplevel(self)
-        win.title("Fix 3D Paths")
-        win.geometry("700x500")
+        win.title("Fix 3D Paths - Select Footprints")
+        win.geometry("1000x700")
         win.configure(bg=COLORS['bg'])
         
-        dry = tk.BooleanVar(value=True)
+        # Options
+        opt_frame = ttk.Labelframe(win, text="Options", padding=12)
+        opt_frame.pack(fill="x", padx=12, pady=(12,8))
+        
         add_missing = tk.BooleanVar(value=True)
         rel = tk.BooleanVar(value=self.rel_models.get())
         
-        ttk.Checkbutton(win, text="Dry run (preview only)", variable=dry).pack(anchor="w", padx=12, pady=6)
-        ttk.Checkbutton(win, text="Add models to footprints with none", variable=add_missing).pack(anchor="w", padx=12, pady=4)
-        ttk.Checkbutton(win, text="Use relative paths", variable=rel).pack(anchor="w", padx=12, pady=4)
+        ttk.Checkbutton(opt_frame, text="Add models to footprints with none", variable=add_missing).pack(anchor="w", pady=2)
+        ttk.Checkbutton(opt_frame, text="Use relative paths", variable=rel).pack(anchor="w", pady=2)
         
-        out = ScrolledText(win, wrap="word", height=15, bg=COLORS['panel'], fg=COLORS['text'])
-        out.pack(fill="both", expand=True, padx=8, pady=8)
+        # Footprint list with checkboxes
+        list_frame = ttk.Labelframe(win, text="Footprints - Check to Update", padding=12)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
         
-        def run_fix():
-            changed, total = fix_footprint_models(
-                fp_dir, models_root, sym_path=sym_path,
-                dry_run=dry.get(), add_if_missing=add_missing.get(),
-                prefer_ext="step", force_relative=rel.get()
-            )
-            out.insert("end", f"{'Dry run' if dry.get() else 'Updated'}: {changed} of {total} footprints\n")
-            messagebox.showinfo("Done", f"{'Preview' if dry.get() else 'Updated'} {changed} of {total} footprints")
+        # Tree view
+        cols = ("footprint", "current", "new_model", "action")
+        tree = ttk.Treeview(list_frame, columns=cols, show="tree headings", selectmode="none")
+        tree.grid(row=0, column=0, sticky="nsew")
         
-        ttk.Button(win, text="Run", command=run_fix, style="Accent.TButton").pack(pady=8)
+        # Scrollbars
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=vsb.set)
+        
+        hsb = ttk.Scrollbar(list_frame, orient="horizontal", command=tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree.configure(xscrollcommand=hsb.set)
+        
+        # Configure columns
+        tree.heading("#0", text="☐ Select")
+        tree.heading("footprint", text="Footprint")
+        tree.heading("current", text="Current 3D Model")
+        tree.heading("new_model", text="New 3D Model")
+        tree.heading("action", text="Action")
+        
+        tree.column("#0", width=80, anchor="center")
+        tree.column("footprint", width=200, anchor="w")
+        tree.column("current", width=250, anchor="w")
+        tree.column("new_model", width=250, anchor="w")
+        tree.column("action", width=120, anchor="center")
+        
+        # Track checked items
+        checked_items = {}
+        
+        def toggle_check(event):
+            item = tree.identify_row(event.y)
+            if item:
+                current = tree.item(item, "text")
+                if current == "☐":
+                    tree.item(item, text="☑")
+                    checked_items[item] = True
+                else:
+                    tree.item(item, text="☐")
+                    checked_items[item] = False
+        
+        tree.bind("<Button-1>", toggle_check)
+        
+        # Scan button
+        def scan_footprints():
+            # Clear tree
+            for item in tree.get_children():
+                tree.delete(item)
+            checked_items.clear()
+            
+            # Scan footprints
+            all_models_idx = _available_models_index(models_root)
+            
+            for mod_file in sorted(fp_dir.glob("*.kicad_mod")):
+                txt = mod_file.read_text(encoding="utf-8", errors="ignore")
+                
+                # Get current model
+                model_match = re.search(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)
+                current_model = ""
+                if model_match:
+                    current_model = model_match.group(1) or model_match.group(2)
+                    # Simplify display
+                    if "/" in current_model or "\\" in current_model:
+                        current_model = Path(current_model).name
+                
+                # Find best model
+                best = _choose_local_model_smart(all_models_idx, mod_file.stem, "step")
+                new_model = best.name if best else ""
+                
+                # Determine action
+                if not model_match and best and add_missing.get():
+                    action = "➕ Add"
+                    tag = "add"
+                elif model_match and best and current_model != new_model:
+                    action = "🔧 Fix Path"
+                    tag = "fix"
+                elif model_match and best and current_model == new_model:
+                    action = "✓ OK"
+                    tag = "ok"
+                elif not model_match and not best:
+                    action = "❓ No Model"
+                    tag = "missing"
+                else:
+                    action = "—"
+                    tag = ""
+                
+                # Add to tree
+                item_id = tree.insert("", "end", 
+                    text="☐",
+                    values=(mod_file.stem, current_model or "(none)", new_model or "(not found)", action),
+                    tags=(tag,)
+                )
+                
+                # Auto-check items that need fixing
+                if tag in ("add", "fix"):
+                    tree.item(item_id, text="☑")
+                    checked_items[item_id] = True
+            
+            # Configure tags
+            tree.tag_configure("add", foreground=COLORS['success'])
+            tree.tag_configure("fix", foreground=COLORS['warning'])
+            tree.tag_configure("ok", foreground=COLORS['text_muted'])
+            tree.tag_configure("missing", foreground=COLORS['error'])
+            
+            status_var.set(f"Found {len(tree.get_children())} footprints")
+        
+        # Buttons
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=12, pady=(0,12))
+        
+        status_var = tk.StringVar(value="Click 'Scan' to analyze footprints")
+        ttk.Label(btn_frame, textvariable=status_var, foreground=COLORS['text_muted']).pack(side="left", padx=8)
+        
+        def select_all():
+            for item in tree.get_children():
+                tree.item(item, text="☑")
+                checked_items[item] = True
+        
+        def select_none():
+            for item in tree.get_children():
+                tree.item(item, text="☐")
+                checked_items[item] = False
+        
+        def apply_fixes():
+            to_fix = [tree.item(item)["values"][0] for item, checked in checked_items.items() if checked]
+            if not to_fix:
+                messagebox.showwarning("Nothing Selected", "Please select footprints to update")
+                return
+            
+            if not messagebox.askyesno("Confirm", 
+                f"Apply 3D model fixes to {len(to_fix)} selected footprints?\n\n"
+                "Your rotation/scale/offset settings will be preserved."):
+                return
+            
+            # Apply fixes
+            all_models_idx = _available_models_index(models_root)
+            updated = 0
+            
+            for fp_name in to_fix:
+                mod_file = fp_dir / f"{fp_name}.kicad_mod"
+                if not mod_file.exists():
+                    continue
+                
+                txt = mod_file.read_text(encoding="utf-8", errors="ignore")
+                orig = txt
+                
+                # Rewrite existing models
+                def chooser(path_str):
+                    return _choose_local_model_smart(all_models_idx, path_str, "step")
+                
+                if rel.get():
+                    def make_rel(local_path):
+                        try:
+                            return os.path.relpath(local_path, start=fp_dir).replace("\\", "/")
+                        except:
+                            return local_path.name
+                    txt = _rewrite_all_models(txt, chooser, make_rel)
+                else:
+                    txt = _rewrite_all_models(txt, chooser, None)
+                
+                # Add missing?
+                if add_missing.get() and not re.search(r'\(model\s+', txt):
+                    best = _choose_local_model_smart(all_models_idx, mod_file.stem, "step")
+                    if best:
+                        if rel.get():
+                            try:
+                                rel_path = os.path.relpath(best, start=fp_dir).replace("\\", "/")
+                            except:
+                                rel_path = best.name
+                            model_str = f'(model "{rel_path}")'
+                        else:
+                            sub = "step" if best.suffix.lower() in (".step", ".stp") else "wrl"
+                            model_str = f'(model "${{PERSONAL_LIB_DIR}}/3d/{sub}/{best.name}")'
+                        
+                        if txt.rstrip().endswith(')'):
+                            txt = txt.rstrip()[:-1] + f"\n  {model_str}\n)"
+                        else:
+                            txt = txt + f"\n  {model_str}\n"
+                
+                if txt != orig:
+                    mod_file.write_text(txt, encoding="utf-8")
+                    updated += 1
+            
+            messagebox.showinfo("Success", f"Updated {updated} footprints!\n\nRotations/scales preserved.")
+            win.destroy()
+        
+        ttk.Button(btn_frame, text="🔍 Scan", command=scan_footprints, style="Accent.TButton").pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="✅ Apply Selected", command=apply_fixes, style="Accent.TButton").pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Select None", command=select_none).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Select All", command=select_all).pack(side="right", padx=4)
+        
+        # Auto-scan on open
+        win.after(100, scan_footprints)
     
     def delete_parts_gui(self):
         """Delete parts from library."""
