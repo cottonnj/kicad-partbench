@@ -1,30 +1,44 @@
 #!/usr/bin/env python3
 """
-KiCad Library Tool v5.0
+KiCad Library Tool v5.6
 ═══════════════════════════════════════════════════════════════════════════════
 Modern, portable tool for managing KiCad component libraries.
 
 • Import symbols, footprints, 3D models from ZIP/directories
 • Intelligent duplicate detection (content-based hashing)
 • Automatic 3D model pairing  
+• 3D Models tab — validate, locate, and repair model paths across the library
 • Library management tools
 • Modern dark theme, no external dependencies
 
-Version: 5.0.0 | Date: 2025-10-27 | License: MIT
+Version: 5.6.0 | Date: 2025-11-08 | License: MIT
+
+Changes since 5.5:
+  • FIX : Imported footprints had Windows backslashes left in 3D model paths
+          because the path-normalization replaced "\\\\" (two backslashes)
+          instead of "\\" (one). KiCad's parser then read "\\3" as octal
+          escape chr(3), so paths displayed as "..d\\step\\..." in the viewer.
+          Now correctly converts single backslashes to forward slashes.
+  • NEW : "3D Models" tab — scans every footprint, validates 3D paths, finds
+          missing models in the library directory (exact + fuzzy match with
+          confidence), reports backslash corruption (without modifying any
+          file during scan), and offers an integrated manual search.
+  • NEW : "Fix Corrupted Paths…" preview dialog — shows current vs proposed
+          path for every affected footprint, lets the user untick any row
+          to skip, fixes ticked rows on confirm, then shows a summary list.
+  • NEW : Import skip-list — packages already imported are remembered in
+          a per-library JSON log (".kicad_personal_import_log.json") and
+          skipped on next import. Vastly speeds up incremental imports
+          (add 1 part to a folder of 50, only that 1 is processed).
+          Tools → View / Reset Import Log… to inspect or clear.
+  • NEW : Detailed import summary popup — lists actual symbol/footprint/
+          model names that were imported, not just totals.
+  • FIX : Manual 3D assign dialog crash (scrolledtext.ScrolledText name).
+  • FIX : "Switch to Results tab" used a hard-coded index that pointed to
+          the wrong tab after the new 3D Models tab was inserted; now
+          looks up the tab by label.
 ═══════════════════════════════════════════════════════════════════════════════
 """
-#!/usr/bin/env python3
-# Kicad Library Tool — v4.6
-# Keeps ALL v3.9 features + v4.1 (3D root, relative paths, Delete Parts)
-# NEW in v4.2:
-#  • Import-time 3D pairing: if a package (zip/folder) contains *.kicad_mod and *.step/*.stp/*.wrl,
-#    we assume they belong together and write (model ...) into the imported footprint(s).
-#    Heuristics: 1-to-1 (single FP & single 3D) -> pair; otherwise try name-stem match / fuzzy match;
-#    otherwise, if symbols provide an MPN/Value, try matching 3D to that.
-#  • Symbol-aware "Fix 3D Paths": if no model is found by footprint module name, it also tries
-#    the symbol names/values that reference that footprint.
-#
-# Python stdlib only (tkinter).
 import os
 import re
 import sys
@@ -47,6 +61,114 @@ NONESSENTIAL_PROPS = {"Datasheet","Description","ki_description","ki_keywords","
                       "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
                       "Link","URL","Alt","Notes"}
 PREFS_FILE = Path.home() / ".kicad_personal_importer.json"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IMPORT LOG  (skip-list to speed up incremental imports)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Stored as a JSON file inside the personal library directory:
+#     <personal>/.kicad_personal_import_log.json
+#
+# Per-package fingerprint:
+#     zip  → "zip|<resolved-lower>|<size>|<int(mtime)>"
+#     dir  → "dir|<resolved-lower>|<int(mtime)>"
+#
+# A zip swapped on disk (different size or mtime) gets a new fingerprint and
+# is therefore re-imported. A directory whose top-level mtime hasn't changed
+# is considered already-imported. (Directories whose mtime is stale because
+# only nested files changed will be skipped — there's a "Reset Import Log"
+# escape hatch in the Tools menu for that case.)
+class ImportLog:
+    FILENAME = ".kicad_personal_import_log.json"
+
+    def __init__(self, personal_root: Path):
+        self.personal_root = Path(personal_root) if personal_root else None
+        self.path = (self.personal_root / self.FILENAME) if self.personal_root else None
+        self._data = {"version": 1, "packages": {}}
+        self._load()
+
+    # ---- IO ----
+    def _load(self):
+        if self.path and self.path.exists():
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(d, dict):
+                    self._data = d
+                    self._data.setdefault("version", 1)
+                    self._data.setdefault("packages", {})
+            except Exception:
+                pass
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            self.path.write_text(json.dumps(self._data, indent=2),
+                                 encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---- Fingerprints ----
+    @staticmethod
+    def fingerprint(kind: str, path: Path) -> str:
+        try:
+            rp = str(Path(path).resolve()).lower()
+        except Exception:
+            rp = str(path).lower()
+        try:
+            stat = path.stat()
+        except Exception:
+            return f"{kind}|{rp}|0|0"
+        if kind == "zip":
+            return f"zip|{rp}|{stat.st_size}|{int(stat.st_mtime)}"
+        return f"dir|{rp}|{int(stat.st_mtime)}"
+
+    # ---- Queries ----
+    def contains(self, kind: str, path: Path) -> bool:
+        return self.fingerprint(kind, path) in self._data["packages"]
+
+    def count(self) -> int:
+        return len(self._data.get("packages", {}))
+
+    def list_entries(self):
+        """Yield (fingerprint_key, dict) for each remembered package."""
+        for k, v in self._data.get("packages", {}).items():
+            yield k, v
+
+    # ---- Mutations ----
+    def remember(self, kind: str, path: Path, summary: dict = None):
+        fp = self.fingerprint(kind, path)
+        entry = {
+            "kind": kind,
+            "path": str(path),
+            "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            stat = path.stat()
+            entry["mtime"] = stat.st_mtime
+            if kind == "zip":
+                entry["size"] = stat.st_size
+        except Exception:
+            pass
+        if summary:
+            entry["summary"] = {
+                k: summary.get(k, 0)
+                for k in ("symbols_added", "symbols_renamed", "symbols_overwritten",
+                          "footprints_imported", "models_copied", "models_paired")
+            }
+        self._data["packages"][fp] = entry
+
+    def forget(self, kind: str, path: Path) -> bool:
+        fp = self.fingerprint(kind, path)
+        if fp in self._data["packages"]:
+            del self._data["packages"][fp]
+            return True
+        return False
+
+    def reset(self):
+        self._data = {"version": 1, "packages": {}}
+
 
 def ensure_paths(personal_dir: Path, sym_name: str, fp_folder: str):
     (personal_dir / fp_folder).mkdir(parents=True, exist_ok=True)
@@ -165,18 +287,61 @@ def _choose_local_model_smart(all_idx, key_name: str, prefer: str="step"):
     return best[0] if best[1] >= 0.62 else None
 
 def _rewrite_all_models(txt: str, chooser, make_rel=None):
-    def repl(m):
-        path = m.group(1) or m.group(2)
+    """Rewrite model paths in footprint text, preserving transform data."""
+    result = []
+    pos = 0
+    
+    while True:
+        # Find next model block
+        match = re.search(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt[pos:])
+        if not match:
+            result.append(txt[pos:])
+            break
+        
+        # Append text before model
+        result.append(txt[pos:pos + match.start()])
+        
+        # Find complete model block by counting parentheses
+        model_start = pos + match.start()
+        paren_count = 0
+        i = model_start
+        
+        while i < len(txt):
+            if txt[i] == '(':
+                paren_count += 1
+            elif txt[i] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    i += 1  # Include closing paren
+                    break
+            i += 1
+        
+        model_block = txt[model_start:i]
+        path = match.group(1) or match.group(2)
+        
+        # Get new model path
         local = chooser(path)
         if local:
             if make_rel:
-                relpath = make_rel(local)
-                return f'(model "{relpath}"'
+                new_path = make_rel(local)
             else:
                 sub = "step" if local.suffix.lower() in (".step",".stp") else "wrl"
-                return f'(model "${{PERSONAL_LIB_DIR}}/3d/{sub}/{local.name}"'
-        return m.group(0)
-    return re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', repl, txt)
+                new_path = f"${{PERSONAL_LIB_DIR}}/3d/{sub}/{local.name}"
+            
+            # Replace just the path, keeping all transform data
+            new_block = re.sub(
+                r'(\(model\s+)(?:"[^"]+"|[^\s)]+)',
+                rf'\1"{new_path}"',
+                model_block,
+                count=1
+            )
+            result.append(new_block)
+        else:
+            result.append(model_block)
+        
+        pos = i
+    
+    return ''.join(result)
 
 # --------------- Symbols ---------------
 def parse_symbol_blocks(text: str):
@@ -281,20 +446,40 @@ def write_symbols_file(sym_path: Path, blocks_by_name: dict):
 
 # --------------- Import copy helpers ---------------
 def copy_3d_models(staging: Path, personal: Path, overwrite=False, log=lambda *a: None):
+    """Copy STEP/WRL files from staging into the personal library.
+
+    Creates ``personal/3d/step`` and ``personal/3d/wrl`` if missing so this
+    function works standalone (the import flow's ``ensure_paths`` does this
+    too, but other callers — e.g. the 3D Models tab tests — don't).
+
+    Returns (mapping, copied_count, copied_names).
+        mapping       : {filename → "${PERSONAL_LIB_DIR}/3d/<sub>/<filename>"}
+        copied_count  : int — how many files were actually copied to disk
+        copied_names  : list[str] — filenames that were newly copied this run
+    """
     steps = find_files(staging, ["*.step", "*.stp"])
     wrls  = find_files(staging, ["*.wrl"])
+    step_dir = personal / "3d" / "step"
+    wrl_dir  = personal / "3d" / "wrl"
+    if steps:
+        step_dir.mkdir(parents=True, exist_ok=True)
+    if wrls:
+        wrl_dir.mkdir(parents=True, exist_ok=True)
     mapping = {}; copied = 0
+    copied_names = []
     for f in steps:
-        dest = personal / "3d" / "step" / f.name
+        dest = step_dir / f.name
         if overwrite or not dest.exists():
             shutil.copy2(f, dest); copied += 1; log(f"[3D] Copied: {f.name}")
+            copied_names.append(f.name)
         mapping[f.name] = "${PERSONAL_LIB_DIR}/3d/step/" + f.name
     for f in wrls:
-        dest = personal / "3d" / "wrl" / f.name
+        dest = wrl_dir / f.name
         if overwrite or not dest.exists():
             shutil.copy2(f, dest); copied += 1; log(f"[3D] Copied: {f.name}")
+            copied_names.append(f.name)
         mapping[f.name] = "${PERSONAL_LIB_DIR}/3d/wrl/" + f.name
-    return mapping, copied
+    return mapping, copied, copied_names
 
 def import_footprints(staging: Path, personal: Path, fp_folder: str, overwrite=False, log=lambda *a: None):
     mods = find_files(staging, ["*.kicad_mod"])
@@ -455,7 +640,13 @@ def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_di
     # Build the path we will write
     if use_relative:
         try:
-            rel = os.path.relpath(model_path, start=relative_to_dir).replace("\\\\","/")
+            # NOTE: replace single backslash with forward slash. Previously
+            # this used "\\\\" which in a Python string literal is two
+            # backslashes -- so single backslashes from os.path.relpath
+            # survived into the .kicad_mod file and were then interpreted
+            # as escape sequences by KiCad's S-expression parser
+            # (e.g. \3 -> chr(3)), producing junk paths like "..d\step\...".
+            rel = os.path.relpath(model_path, start=relative_to_dir).replace("\\","/")
         except Exception:
             rel = model_path.name
         new_model_str = f'(model "{rel}")'
@@ -492,17 +683,27 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
         "footprints_imported": 0, "footprints_skipped": 0, "footprints_errors": 0,
         "symbols_added": 0, "symbols_renamed": 0, "symbols_overwritten": 0,
         "symbols_skipped_content_dupe": 0, "symbols_skipped_exact": 0, "models_copied": 0, "errors": [],
-        "symbol_names_debug": [], "models_paired": 0
+        "symbol_names_debug": [], "models_paired": 0,
+        # Detailed name lists -- consumed by the post-import summary dialog
+        # so the user can see exactly what came from this package.
+        "symbols_added_names": [],
+        "symbols_renamed_pairs": [],   # list[tuple[old_name, new_name]]
+        "symbols_overwritten_names": [],
+        "footprints_added_names": [],
+        "models_copied_names": [],
+        "models_paired_pairs": [],     # list[tuple[footprint_name, model_name]]
     }
     try:
         if kind == "zip": staging, tmpdir = unzip_if_needed(path)
         else: staging, tmpdir = (path, None)
 
         # copy 3D + footprints
-        model_map, copied3d = copy_3d_models(staging, personal, overwrite=overwrite, log=log)
+        model_map, copied3d, copied_names = copy_3d_models(staging, personal, overwrite=overwrite, log=log)
         res["models_copied"] = copied3d
+        res["models_copied_names"] = copied_names
         fps_paths, imported, skipped, fp_errs = import_footprints(staging, personal, fp_folder, overwrite=overwrite, log=log)
         res["footprints_imported"] = len(imported); res["footprints_skipped"] = len(skipped); res["footprints_errors"] = len(fp_errs)
+        res["footprints_added_names"] = list(imported)
 
         # Import-time 3D pairing
         if import_pair_models and not dry_run and fps_paths:
@@ -515,9 +716,11 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
                 sym_cands = _symbol_candidates_from_files(sym_files)
                 # One-to-one fast path
                 if len(fps_paths) == 1 and len(staged_models) == 1:
-                    _write_model_into_footprint(fps_paths[0], personal / ("3d/step" if staged_models[0].suffix.lower() in (".step",".stp") else "3d/wrl") / staged_models[0].name,
+                    chosen_model = personal / ("3d/step" if staged_models[0].suffix.lower() in (".step",".stp") else "3d/wrl") / staged_models[0].name
+                    _write_model_into_footprint(fps_paths[0], chosen_model,
                                                 personal / fp_folder, force_relative_models)
                     res["models_paired"] += 1
+                    res["models_paired_pairs"].append((Path(fps_paths[0]).name, chosen_model.name))
                     log(f"[3D] Paired (1:1): {Path(fps_paths[0]).name} -> {staged_models[0].name}")
                 else:
                     # fuzzy map
@@ -542,6 +745,7 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
                             if best:
                                 _write_model_into_footprint(mod_path, best, personal / fp_folder, force_relative_models)
                                 res["models_paired"] += 1
+                                res["models_paired_pairs"].append((Path(mod_path).name, best.name))
                                 log(f"[3D] Paired: {Path(mod_path).name} -> {best.name}")
                         except Exception as e:
                             log(f"[3D] Pairing error for {Path(mod_path).name}: {e}")
@@ -559,6 +763,9 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
             res["symbols_skipped_content_dupe"] = len(stats["skipped_content_dupe"])
             res["symbols_skipped_exact"] = len(stats.get("skipped_exact", []))
             res["symbol_names_debug"] = stats["debug_symbols"]
+            res["symbols_added_names"] = list(stats["added"])
+            res["symbols_renamed_pairs"] = list(stats["renamed"])
+            res["symbols_overwritten_names"] = list(stats["overwritten"])
             if not dry_run:
                 write_symbols_file(personal_sym, merged)
         if tmpdir: shutil.rmtree(tmpdir, ignore_errors=True)
@@ -639,6 +846,8 @@ def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Path=None, d
                     new_txt = new_txt.rstrip()[:-1] + insert + ")\n"
                 else:
                     new_txt = new_txt + insert
+        # Collapse duplicate model entries before comparing
+        new_txt = _dedupe_models_in_text(new_txt, fp_dir, Path(fp_dir).parent)
         if new_txt != txt:
             changed += 1; modified.append(mod_path)
             if not dry_run:
@@ -646,8 +855,6 @@ def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Path=None, d
                 try: mod_path.rename(bak)
                 except Exception: pass
                 mod_path.write_text(new_txt, encoding="utf-8")
-        # Always collapse duplicate model entries (idempotent)
-        new_txt = _dedupe_models_in_text(new_txt, fp_dir, Path(fp_dir).parent)
 
     return changed, total, modified
 
@@ -704,28 +911,60 @@ def _norm_model_key(path_str: str, fp_dir: Path, personal_root: Path) -> str:
     key = Path(p).name.lower()
     return key
 
+def _extract_model_blocks(txt: str):
+    """Extract complete (model ...) blocks using paren-counting, preserving transforms."""
+    blocks = []
+    pos = 0
+    while True:
+        match = re.search(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt[pos:])
+        if not match:
+            break
+        model_start = pos + match.start()
+        path = match.group(1) or match.group(2)
+        # Count parens to find complete block
+        paren_count = 0
+        i = model_start
+        while i < len(txt):
+            if txt[i] == '(':
+                paren_count += 1
+            elif txt[i] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    i += 1
+                    break
+            i += 1
+        full_block = txt[model_start:i]
+        blocks.append((model_start, i, path, full_block))
+        pos = i
+    return blocks
+
 def _dedupe_models_in_text(txt: str, fp_dir: Path, personal_root: Path) -> str:
-    models = [(m.group(0), m.group(1) or m.group(2)) for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
-    if not models:
+    blocks = _extract_model_blocks(txt)
+    if not blocks:
         return txt
     seen = set()
-    keep = []
-    for full, path in models:
+    to_remove = []
+    for start, end, path, full_block in blocks:
         key = _norm_model_key(path, fp_dir, personal_root)
         if key in seen:
-            continue
-        seen.add(key)
-        keep.append(full)
-    if len(keep) == len(models):
+            to_remove.append((start, end))
+        else:
+            seen.add(key)
+    if not to_remove:
         return txt
-    base = re.sub(r'\s*\(model\s+(?:"[^"]+"|[^\s)]+)\s*\)', '', txt)
-    insert_block = "".join(f"\n  {k}" for k in keep)
-    base = base.rstrip()
-    if base.endswith(')'):
-        base = base[:-1] + insert_block + "\n)"
-    else:
-        base = base + insert_block
-    return base
+    # Remove duplicate blocks back-to-front to preserve indices
+    result = txt
+    for start, end in reversed(to_remove):
+        # Also remove leading whitespace on the same line
+        ws_start = start
+        while ws_start > 0 and result[ws_start - 1] in (' ', '\t'):
+            ws_start -= 1
+        # Remove trailing newline if present
+        ws_end = end
+        if ws_end < len(result) and result[ws_end] == '\n':
+            ws_end += 1
+        result = result[:ws_start] + result[ws_end:]
+    return result
 
 
 
@@ -783,7 +1022,7 @@ def _rewrite_fp_lib_table(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=
         txt = tbl.read_text(encoding="utf-8", errors="ignore")
         def repl(m):
             uri = m.group(1)
-            u_norm = uri.replace("\\\\", "/")
+            u_norm = uri.replace("\\", "/")
             try:
                 u_path = u_norm
                 if u_path.lower().startswith("file://"):
@@ -801,7 +1040,7 @@ def _rewrite_fp_lib_table(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=
                     if str(ap).lower().startswith(str(root).lower()):
                         rel = ap.relative_to(root)
                         path_rel = str(rel).replace("\\", "/")
-                        return f'(uri "${{var_name}}/{path_rel}")'
+                        return f'(uri "${{{var_name}}}/{path_rel}")'
             except Exception:
                 pass
             return m.group(0)
@@ -819,7 +1058,7 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
             txt = mod.read_text(encoding="utf-8", errors="ignore")
             def repl(m):
                 inner = m.group(1) or m.group(2)
-                s = inner.replace("\\\\","/")
+                s = inner.replace("\\","/")
                 try:
                     p = Path(s)
                     if not (s.startswith("${") or s.lower().startswith("file://")):
@@ -830,7 +1069,7 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
                         if str(rp).lower().startswith(str(root).lower()):
                             rel = rp.relative_to(root)
                             path_rel = str(rel).replace("\\", "/")
-                            return f'(model "${{var_name}}/{path_rel}")'
+                            return f'(model "${{{var_name}}}/{path_rel}")'
                 except Exception:
                     pass
                 return f'(model "{inner}")'
@@ -851,6 +1090,256 @@ def _rewrite_models_in_pretty(pretty_dir: Path, personal_root: Path, var_name="P
     except Exception:
         pass
     return cnt_changed
+
+def _rewrite_models(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=lambda *a: None):
+    """Rewrite 3D model paths in the footprints.pretty directory under personal_root."""
+    pretty_dir = personal_root / "footprints.pretty"
+    if not pretty_dir.exists():
+        log(f"[Paths] Footprint directory not found: {pretty_dir}")
+        return 0
+    return _rewrite_models_in_pretty(pretty_dir, personal_root, var_name=var_name, log=log)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3D MODEL VALIDATION & RESOLUTION (used by the 3D Models tab)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def resolve_model_path(path_str: str, fp_dir: Path, personal_root: Path) -> tuple:
+    """Resolve a (model "...") path string to a real filesystem Path.
+
+    Handles ${PERSONAL_LIB_DIR} substitution, absolute paths, relative paths
+    (resolved against the footprint directory), and Windows backslash
+    separators that may have leaked in.
+
+    Returns (Path, bool exists). The returned Path is always an attempt at
+    resolution even if the file does not exist.
+    """
+    if not path_str:
+        return Path(""), False
+    p = path_str.replace("\\", "/")
+    try:
+        if "${PERSONAL_LIB_DIR}" in p:
+            rest = p.split("}", 1)[1].lstrip("/")
+            resolved = (personal_root / rest)
+        elif p.startswith("/") or re.match(r'^[A-Za-z]:/', p):
+            resolved = Path(p)
+        else:
+            resolved = (fp_dir / p)
+        try:
+            resolved = resolved.resolve()
+        except Exception:
+            pass
+        return resolved, resolved.exists()
+    except Exception:
+        return Path(p), False
+
+
+def fix_corrupted_model_paths(fp_path: Path) -> int:
+    """In-place: convert backslashes inside (model "...") path strings to
+    forward slashes. Preserves all transform data (offset, scale, rotate).
+    Returns the number of paths that were rewritten.
+    """
+    try:
+        txt = fp_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return 0
+    blocks = _extract_model_blocks(txt)
+    if not blocks:
+        return 0
+
+    fixed = 0
+    pieces = []
+    last_end = 0
+    for start, end, path, full_block in blocks:
+        if "\\" in path:
+            new_path = path.replace("\\", "/")
+            new_block = re.sub(
+                r'(\(model\s+)(?:"[^"]+"|[^\s)]+)',
+                lambda m, np=new_path: f'{m.group(1)}"{np}"',
+                full_block,
+                count=1,
+            )
+            pieces.append(txt[last_end:start])
+            pieces.append(new_block)
+            last_end = end
+            fixed += 1
+    if fixed == 0:
+        return 0
+    pieces.append(txt[last_end:])
+    new_txt = "".join(pieces)
+    try:
+        fp_path.write_text(new_txt, encoding="utf-8")
+        return fixed
+    except Exception:
+        return 0
+
+
+def find_model_for_footprint(fp_name: str, models_index, prefer_ext: str = "step"):
+    """Search the models index for a 3D model matching a footprint name.
+
+    Search order:
+      1. Exact stem match (case-insensitive)
+      2. Canonicalized stem match (ignores punctuation/case)
+      3. Fuzzy match (n-gram score), threshold 0.62
+
+    Returns (Path or None, confidence float 0..1, method str).
+    method ∈ {"exact", "canon", "fuzzy", "none"}.
+    """
+    if not models_index:
+        return None, 0.0, "none"
+    exact, stems, canon, files = models_index
+    if not files:
+        return None, 0.0, "none"
+
+    fp_lower = fp_name.lower()
+    if fp_lower in stems:
+        return _prefer_ext(stems[fp_lower], prefer_ext), 1.0, "exact"
+
+    fp_canon = _canon(fp_name)
+    if fp_canon in canon:
+        return _prefer_ext(canon[fp_canon], prefer_ext), 0.95, "canon"
+
+    best, best_score = None, 0.0
+    for f in files:
+        s = _score(_canon(f.stem), fp_canon)
+        if s > best_score:
+            best, best_score = f, s
+    if best and best_score >= 0.62:
+        return best, best_score, "fuzzy"
+    return None, best_score, "none"
+
+
+def analyze_footprint_3d(fp_path: Path, models_root: Path, personal_root: Path,
+                         models_index=None, prefer_ext: str = "step") -> dict:
+    """Inspect a single footprint for 3D model status.
+
+    This function does NOT modify the footprint file. Backslash-corrupted
+    paths are flagged via ``info["corrupted"]`` so the caller can present
+    them for confirmation; use ``fix_corrupted_model_paths`` to repair them
+    once the user has approved.
+
+    Returns a dict with keys:
+        fp_path, fp_name, status, raw_path, resolved, file_exists, corrupted,
+        suggested, suggested_confidence, suggested_method, error
+
+    status ∈ {"ok", "missing", "no_path", "error"}
+    Note: "found_*" is no longer returned -- whether a suggestion exists is
+    indicated by ``suggested is not None``. The UI buckets rows itself.
+    """
+    info = {
+        "fp_path": fp_path,
+        "fp_name": fp_path.stem,
+        "status": "unknown",
+        "raw_path": "",
+        "resolved": None,
+        "file_exists": False,
+        "corrupted": False,
+        "suggested": None,
+        "suggested_confidence": 0.0,
+        "suggested_method": "",
+        "error": "",
+    }
+
+    try:
+        txt = fp_path.read_text(encoding="utf-8", errors="ignore")
+        matches = re.findall(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)
+        paths = [a or b for (a, b) in matches]
+
+        # Flag legacy-corrupted paths (Windows backslash separators inside
+        # the (model "...") string). The path resolver below already
+        # tolerates them, but the file-on-disk still needs to be cleaned
+        # before KiCad will read it correctly.
+        info["corrupted"] = any("\\" in p for p in paths)
+
+        if not paths:
+            info["status"] = "no_path"
+            if models_index is None:
+                models_index = _available_models_index(models_root)
+            sug, conf, method = find_model_for_footprint(fp_path.stem, models_index, prefer_ext)
+            if sug is not None:
+                info["suggested"] = sug
+                info["suggested_confidence"] = conf
+                info["suggested_method"] = method
+            return info
+
+        first = paths[0]
+        info["raw_path"] = first
+        resolved, exists = resolve_model_path(first, fp_path.parent, personal_root)
+        info["resolved"] = resolved
+        info["file_exists"] = exists
+        if exists:
+            info["status"] = "ok"
+        else:
+            info["status"] = "missing"
+            if models_index is None:
+                models_index = _available_models_index(models_root)
+            sug, conf, method = find_model_for_footprint(fp_path.stem, models_index, prefer_ext)
+            if sug is not None:
+                info["suggested"] = sug
+                info["suggested_confidence"] = conf
+                info["suggested_method"] = method
+        return info
+    except Exception as e:
+        info["status"] = "error"
+        info["error"] = str(e)
+        return info
+
+
+def replace_model_path_in_footprint(fp_path: Path, new_model_path: Path,
+                                    fp_dir: Path, personal_root: Path,
+                                    use_relative: bool = True,
+                                    keep_existing_transforms: bool = True) -> bool:
+    """Replace (or add, if absent) the FIRST (model ...) entry in a footprint
+    with a reference to ``new_model_path``. Preserves transform data of the
+    existing entry when keep_existing_transforms is True.
+
+    use_relative=True writes a path relative to fp_dir.
+    use_relative=False writes ``${PERSONAL_LIB_DIR}/3d/<sub>/<name>``.
+
+    Returns True on a write, False on no-op.
+    """
+    try:
+        txt = fp_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+
+    if use_relative:
+        try:
+            rel = os.path.relpath(new_model_path, start=fp_dir).replace("\\", "/")
+        except Exception:
+            rel = new_model_path.name
+        new_path_str = rel
+    else:
+        sub = "step" if new_model_path.suffix.lower() in (".step", ".stp") else "wrl"
+        new_path_str = f'${{PERSONAL_LIB_DIR}}/3d/{sub}/{new_model_path.name}'
+
+    blocks = _extract_model_blocks(txt)
+    if blocks:
+        # Replace path of the FIRST model block, preserve everything else
+        start, end, _path, full_block = blocks[0]
+        new_block = re.sub(
+            r'(\(model\s+)(?:"[^"]+"|[^\s)]+)',
+            lambda m, np=new_path_str: f'{m.group(1)}"{np}"',
+            full_block,
+            count=1,
+        )
+        new_txt = txt[:start] + new_block + txt[end:]
+    else:
+        # No existing model — append a fresh one inside the closing paren
+        insert = f'\n  (model "{new_path_str}")\n'
+        if txt.rstrip().endswith(")"):
+            new_txt = txt.rstrip()[:-1] + insert + ")\n"
+        else:
+            new_txt = txt + insert
+
+    if new_txt == txt:
+        return False
+    try:
+        fp_path.write_text(new_txt, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
 
 # -------------------- GUI --------------------
 
@@ -873,7 +1362,7 @@ def apply_modern_theme(root):
     style = ttk.Style()
     try:
         style.theme_use("clam")
-    except:
+    except Exception:
         pass
     
     # Base styles
@@ -942,7 +1431,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         
-        self.title("⚡ KiCad Library Tool 5.4")
+        self.title("⚡ KiCad Library Tool 5.6")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         
@@ -960,6 +1449,9 @@ class App(tk.Tk):
         self.ignore_fp_dedupe = tk.BooleanVar(value=True)
         self.dedupe_mode = tk.StringVar(value="Ignore Properties")
         self.dry_run = tk.BooleanVar(value=False)
+        # Skip packages already in the import log -- speeds up incremental
+        # imports massively. The user can clear the log from Tools menu.
+        self.skip_imported = tk.BooleanVar(value=True)
         self.prefer_pkg = tk.StringVar(value="folder")
         self.sym_choice = tk.StringVar(value="symbols.kicad_sym")
         self.fp_choice = tk.StringVar(value="footprints.pretty")
@@ -984,6 +1476,7 @@ class App(tk.Tk):
         self.rel_models.set(prefs.get("rel_models", True))
         self.nick.set(prefs.get("footprint_nickname", "Personal_Footprints"))
         self.autoset.set(prefs.get("autoset", True))
+        self.skip_imported.set(prefs.get("skip_imported", True))
         self.recent_sources = prefs.get("recent_sources", [])[:10]
         self.recent_personal = prefs.get("recent_personal", [])[:10]
         
@@ -1022,6 +1515,9 @@ class App(tk.Tk):
         tools_menu.add_command(label="Audit Footprints (3D)", command=self.audit_footprints_gui)
         tools_menu.add_command(label="Fix 3D Paths...", command=self.fix_3d_paths_gui)
         tools_menu.add_command(label="Delete Parts...", command=self.delete_parts_gui)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="View / Reset Import Log...",
+                               command=self.show_import_log_gui)
         menubar.add_cascade(label="Tools", menu=tools_menu)
         
         # Help menu
@@ -1041,18 +1537,21 @@ class App(tk.Tk):
         # Create tabs
         tab_import = ttk.Frame(notebook)
         tab_library = ttk.Frame(notebook)
+        tab_3d = ttk.Frame(notebook)
         tab_bom = ttk.Frame(notebook)
         tab_settings = ttk.Frame(notebook)
         tab_results = ttk.Frame(notebook)
         
         notebook.add(tab_import, text=" 📁 Import ")
         notebook.add(tab_library, text=" 📚 Library ")
+        notebook.add(tab_3d, text=" 🎲 3D Models ")
         notebook.add(tab_bom, text=" 📋 BOM Manager ")
         notebook.add(tab_settings, text=" ⚙️ Settings ")
         notebook.add(tab_results, text=" 📊 Results ")
         
         self._create_import_tab(tab_import)
         self._create_library_tab(tab_library)
+        self._create_3d_models_tab(tab_3d)
         self._create_bom_manager_tab(tab_bom)
         self._create_settings_tab(tab_settings)
         self._create_results_tab(tab_results)
@@ -1062,8 +1561,13 @@ class App(tk.Tk):
         # Auto-refresh library when tab is selected
         def on_tab_change(event):
             tab_id = notebook.index(notebook.select())
-            if tab_id == 1:  # Library tab (0=Import, 1=Library)
+            if tab_id == 1:  # Library tab
                 self.refresh_library_browser()
+            elif tab_id == 2:  # 3D Models tab
+                # Only auto-scan the first time the user lands on the tab
+                if not getattr(self, "_3d_tab_first_visit_done", False):
+                    self._3d_tab_first_visit_done = True
+                    self.after(50, self.scan_3d_models_tab)
         
         notebook.bind("<<NotebookTabChanged>>", on_tab_change)
 
@@ -1131,6 +1635,17 @@ class App(tk.Tk):
         ttk.Checkbutton(lf3, text="Ignore footprint in deduplication", variable=self.ignore_fp_dedupe).grid(row=2, column=1, sticky="w", padx=4, pady=4)
         
         ttk.Checkbutton(lf3, text="Dry run (preview only)", variable=self.dry_run).grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        
+        # Skip-already-imported (the speed-up). Tip label sits next to it.
+        skip_frame = ttk.Frame(lf3)
+        skip_frame.grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 4))
+        ttk.Checkbutton(
+            skip_frame,
+            text="Skip already-imported packages (faster on incremental imports)",
+            variable=self.skip_imported,
+        ).pack(side="left")
+        ttk.Button(skip_frame, text="📜 View / reset import log…",
+                   command=self.show_import_log_gui).pack(side="left", padx=(16, 0))
         
         # Action buttons
         btn_container = ttk.Frame(parent)
@@ -1218,6 +1733,918 @@ class App(tk.Tk):
         # Auto-load if library path is set
         if self.personal.get():
             self.after(100, self.refresh_library_browser)
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3D MODELS TAB
+    # ═══════════════════════════════════════════════════════════════════════
+    def _create_3d_models_tab(self, parent):
+        """3D Models tab — validate every footprint's 3D path, find missing
+        models, auto-fix backslash corruption, and provide a manual search
+        for the stragglers."""
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+        
+        # ---- Top toolbar (search + filter + scan) ----
+        top = ttk.Frame(parent)
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        top.grid_columnconfigure(1, weight=1)
+        
+        ttk.Label(top, text="🔍 Search:").grid(row=0, column=0, padx=(0, 8))
+        self._3d_search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self._3d_search_var, font=("Segoe UI", 10)
+                 ).grid(row=0, column=1, sticky="ew", padx=4)
+        
+        ttk.Label(top, text="Show:").grid(row=0, column=2, padx=(12, 4))
+        self._3d_filter_var = tk.StringVar(value="All")
+        filter_cb = ttk.Combobox(
+            top, textvariable=self._3d_filter_var, width=26, state="readonly",
+            values=[
+                "All",
+                "Issues only (everything except OK)",
+                "✅ OK",
+                "🔧 Corrupted (backslash)",
+                "❌ Missing file",
+                "❓ No path",
+                "🔍 Suggested by search",
+                "⚠️ Not found",
+            ],
+        )
+        filter_cb.grid(row=0, column=3, padx=4)
+        
+        ttk.Button(top, text="🔄 Scan", command=self.scan_3d_models_tab,
+                   style="Accent.TButton").grid(row=0, column=4, padx=4)
+        
+        self._3d_search_var.trace_add("write", lambda *a: self._refresh_3d_tree())
+        self._3d_filter_var.trace_add("write", lambda *a: self._refresh_3d_tree())
+        
+        # ---- Summary banner ----
+        banner = ttk.Frame(parent)
+        banner.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self._3d_summary_var = tk.StringVar(
+            value="Click 'Scan' to inspect every footprint in the library."
+        )
+        ttk.Label(banner, textvariable=self._3d_summary_var,
+                  foreground=COLORS['text_muted'],
+                  background=COLORS['panel'], padding=8,
+                  relief="solid", borderwidth=1).pack(fill="x")
+        
+        # ---- Instructions ----
+        instr = ttk.Frame(parent)
+        instr.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        ttk.Label(
+            instr,
+            text=("📋  No files are modified during scan."
+                  "    Use 'Fix Corrupted Paths…' to repair backslash damage (preview first)."
+                  "    Double-click any row to manually search for a model."
+                  "    Tick rows and 'Apply Suggested' to accept search matches."),
+            foreground=COLORS['accent'], font=("Segoe UI", 9, "bold"),
+            background=COLORS['panel'], padding=8, relief="solid", borderwidth=1,
+        ).pack(fill="x")
+        
+        # ---- Main tree ----
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        tree_frame.grid_columnconfigure(0, weight=1)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        
+        cols = ("status", "footprint", "current_path", "resolved", "suggested", "confidence")
+        self._3d_tree = ttk.Treeview(tree_frame, columns=cols, show="tree headings",
+                                     selectmode="extended")
+        self._3d_tree.grid(row=0, column=0, sticky="nsew")
+        
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._3d_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._3d_tree.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self._3d_tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._3d_tree.configure(xscrollcommand=hsb.set)
+        
+        self._3d_tree.heading("#0", text="☐")
+        self._3d_tree.heading("status", text="Status")
+        self._3d_tree.heading("footprint", text="Footprint")
+        self._3d_tree.heading("current_path", text="Current Path")
+        self._3d_tree.heading("resolved", text="Resolves To")
+        self._3d_tree.heading("suggested", text="Suggested 3D Model")
+        self._3d_tree.heading("confidence", text="Confidence")
+        
+        self._3d_tree.column("#0", width=44, anchor="center", stretch=False)
+        self._3d_tree.column("status", width=140, anchor="w", stretch=False)
+        self._3d_tree.column("footprint", width=220, anchor="w")
+        self._3d_tree.column("current_path", width=300, anchor="w")
+        self._3d_tree.column("resolved", width=180, anchor="w")
+        self._3d_tree.column("suggested", width=220, anchor="w")
+        self._3d_tree.column("confidence", width=90, anchor="center", stretch=False)
+        
+        self._3d_tree.tag_configure("ok", foreground=COLORS['success'])
+        self._3d_tree.tag_configure("missing", foreground=COLORS['error'])
+        self._3d_tree.tag_configure("nopath", foreground=COLORS['warning'])
+        self._3d_tree.tag_configure("corrupted", foreground=COLORS['warning'],
+                                    font=("Segoe UI", 10, "bold"))
+        self._3d_tree.tag_configure("found_exact", foreground=COLORS['success'],
+                                    font=("Segoe UI", 10, "bold"))
+        self._3d_tree.tag_configure("found_fuzzy", foreground=COLORS['accent'])
+        self._3d_tree.tag_configure("notfound", foreground=COLORS['error'],
+                                    font=("Segoe UI", 10, "bold"))
+        self._3d_tree.tag_configure("error", foreground=COLORS['error'])
+        
+        self._3d_tree.bind("<Button-1>", self._on_3d_tree_click)
+        self._3d_tree.bind("<Double-1>", self._on_3d_tree_double_click)
+        
+        # ---- Action button row ----
+        actions = ttk.Frame(parent)
+        actions.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 16))
+        
+        ttk.Button(actions, text="Select All Suggested",
+                   command=lambda: self._3d_select_all(only_suggested=True)
+                   ).pack(side="left", padx=2)
+        ttk.Button(actions, text="Select All",
+                   command=lambda: self._3d_select_all(only_suggested=False)
+                   ).pack(side="left", padx=2)
+        ttk.Button(actions, text="Select None",
+                   command=self._3d_select_none).pack(side="left", padx=2)
+        
+        ttk.Button(actions, text="🔎 Manual Search…",
+                   command=self._3d_manual_search_for_selection
+                   ).pack(side="left", padx=12)
+        
+        # Disabled until a scan finds corrupted paths
+        self._3d_fix_corrupted_btn = ttk.Button(
+            actions, text="🔧 Fix Corrupted Paths",
+            command=self._3d_fix_corrupted_paths_dialog,
+            state="disabled",
+        )
+        self._3d_fix_corrupted_btn.pack(side="left", padx=4)
+        
+        ttk.Button(actions, text="✅ Apply Suggested to Checked",
+                   command=self._3d_apply_suggested,
+                   style="Accent.TButton"
+                   ).pack(side="right", padx=4, ipadx=12, ipady=4)
+        
+        # State
+        self._3d_results = []           # list[dict] from analyze_footprint_3d
+        self._3d_checked = set()        # set[fp_name] of ticked rows
+        self._3d_manual_picks = {}      # fp_name -> Path (manually chosen)
+        self._3d_corrupted_count = 0
+        self._3d_tab_first_visit_done = False
+    
+    # ---- 3D Models tab logic ----
+    def scan_3d_models_tab(self):
+        """Walk every footprint, analyze its 3D status, populate the tree.
+
+        Does NOT modify any files -- corrupted backslash paths are reported
+        but only repaired when the user clicks 'Fix Corrupted Paths…'.
+        """
+        fp_dir = self.current_fp_dir()
+        models_root = self.current_models_root()
+        personal_root = Path(self.personal.get()).expanduser()
+        
+        if not fp_dir.exists():
+            self._3d_summary_var.set(
+                f"⚠️  Footprint directory not found: {fp_dir}"
+            )
+            return
+        
+        # Clear tree + state
+        for item in self._3d_tree.get_children():
+            self._3d_tree.delete(item)
+        self._3d_results = []
+        self._3d_checked.clear()
+        # Note: keep self._3d_manual_picks across scans so that picks made
+        # before applying don't vanish if the user re-scans.
+        
+        self._3d_summary_var.set("Scanning footprints…")
+        self.update_idletasks()
+        
+        # Build models index once per scan
+        models_index = _available_models_index(models_root) if models_root.exists() \
+                       else ({}, {}, {}, [])
+        
+        fps = sorted(fp_dir.glob("*.kicad_mod"), key=lambda p: p.name.lower())
+        for fp in fps:
+            info = analyze_footprint_3d(
+                fp, models_root, personal_root,
+                models_index=models_index, prefer_ext="step",
+            )
+            self._3d_results.append(info)
+        
+        self._refresh_3d_tree()
+        
+        # Summary -- count by effective bucket (the same bucketing used by
+        # _refresh_3d_tree's filter logic, kept in sync below).
+        n_ok = n_missing_unmatched = n_nopath_unmatched = 0
+        n_found_exact = n_found_fuzzy = n_corrupted = n_error = 0
+        for info in self._3d_results:
+            if info.get("corrupted"):
+                n_corrupted += 1
+            st = info["status"]
+            has_sug = info.get("suggested") is not None
+            if st == "error":
+                n_error += 1
+            elif st == "ok":
+                n_ok += 1
+            elif st == "missing":
+                if has_sug:
+                    if info["suggested_method"] in ("exact", "canon"):
+                        n_found_exact += 1
+                    else:
+                        n_found_fuzzy += 1
+                else:
+                    n_missing_unmatched += 1
+            elif st == "no_path":
+                if has_sug:
+                    if info["suggested_method"] in ("exact", "canon"):
+                        n_found_exact += 1
+                    else:
+                        n_found_fuzzy += 1
+                else:
+                    n_nopath_unmatched += 1
+        
+        # Cache for the Fix-Corrupted dialog button-state
+        self._3d_corrupted_count = n_corrupted
+        # Update the button (created later) if it exists
+        if hasattr(self, "_3d_fix_corrupted_btn"):
+            try:
+                if n_corrupted:
+                    self._3d_fix_corrupted_btn.config(
+                        text=f"🔧 Fix Corrupted Paths ({n_corrupted})…",
+                        state="normal",
+                    )
+                else:
+                    self._3d_fix_corrupted_btn.config(
+                        text="🔧 Fix Corrupted Paths",
+                        state="disabled",
+                    )
+            except Exception:
+                pass
+        
+        msg_bits = [f"Scanned {len(self._3d_results)} footprints"]
+        msg_bits.append(f"✅ {n_ok} OK")
+        if n_corrupted:
+            msg_bits.append(f"🔧 {n_corrupted} corrupted (click 'Fix Corrupted Paths…')")
+        if n_missing_unmatched:
+            msg_bits.append(f"❌ {n_missing_unmatched} missing")
+        if n_nopath_unmatched:
+            msg_bits.append(f"❓ {n_nopath_unmatched} no path")
+        if n_found_exact:
+            msg_bits.append(f"🎯 {n_found_exact} exact match suggested")
+        if n_found_fuzzy:
+            msg_bits.append(f"🔍 {n_found_fuzzy} fuzzy match suggested")
+        if n_error:
+            msg_bits.append(f"⚠️ {n_error} errors")
+        self._3d_summary_var.set("   |   ".join(msg_bits))
+    
+    def _refresh_3d_tree(self):
+        """Re-render the tree from self._3d_results, applying search + filter."""
+        if not hasattr(self, "_3d_tree"):
+            return
+        for item in self._3d_tree.get_children():
+            self._3d_tree.delete(item)
+        
+        query = self._3d_search_var.get().lower().strip()
+        flt = self._3d_filter_var.get()
+        
+        for info in self._3d_results:
+            fp_name = info["fp_name"]
+            if query and query not in fp_name.lower():
+                cur = info.get("raw_path", "") or ""
+                sug = info.get("suggested")
+                sug_name = sug.name if sug else ""
+                if query not in cur.lower() and query not in sug_name.lower():
+                    continue
+            
+            status = info["status"]
+            corrupted = bool(info.get("corrupted"))
+            has_suggestion = info.get("suggested") is not None
+            
+            # Apply filter
+            if flt == "Issues only (everything except OK)":
+                if status == "ok" and not corrupted:
+                    continue
+            elif flt == "✅ OK":
+                if not (status == "ok" and not corrupted):
+                    continue
+            elif flt == "🔧 Corrupted (backslash)":
+                if not corrupted:
+                    continue
+            elif flt == "❌ Missing file":
+                if not (status == "missing" and not has_suggestion):
+                    continue
+            elif flt == "❓ No path":
+                if not (status == "no_path" and not has_suggestion):
+                    continue
+            elif flt == "🔍 Suggested by search":
+                if not has_suggestion:
+                    continue
+            elif flt == "⚠️ Not found":
+                # Anything where there's a problem but no suggestion to apply
+                ok_or_corrupted_only = (status == "ok") or (corrupted and status != "missing" and status != "no_path")
+                if ok_or_corrupted_only or has_suggestion:
+                    continue
+            
+            # Status string + tag
+            if fp_name in self._3d_manual_picks:
+                status_text = "🎯 Manual pick"
+                tag = "found_exact"
+            elif corrupted and status == "ok":
+                # Path resolves (after backslash normalization), but the file
+                # on disk still has the corrupt path -- needs cleanup.
+                status_text = "🔧 Corrupted path (file OK)"
+                tag = "corrupted"
+            elif corrupted and status == "missing":
+                if has_suggestion:
+                    status_text = "🔧 Corrupted + 🔍 match found"
+                    tag = "corrupted"
+                else:
+                    status_text = "🔧 Corrupted + ❌ missing"
+                    tag = "corrupted"
+            elif status == "ok":
+                status_text = "✅ OK"
+                tag = "ok"
+            elif status == "missing" and has_suggestion:
+                if info["suggested_method"] in ("exact", "canon"):
+                    status_text = "❌ Missing → 🎯 exact match found"
+                    tag = "found_exact"
+                else:
+                    status_text = "❌ Missing → 🔍 fuzzy match"
+                    tag = "found_fuzzy"
+            elif status == "missing":
+                status_text = "❌ Missing file"
+                tag = "missing"
+            elif status == "no_path" and has_suggestion:
+                if info["suggested_method"] in ("exact", "canon"):
+                    status_text = "❓ No path → 🎯 exact match found"
+                    tag = "found_exact"
+                else:
+                    status_text = "❓ No path → 🔍 fuzzy match"
+                    tag = "found_fuzzy"
+            elif status == "no_path":
+                status_text = "❓ No path / not found"
+                tag = "notfound"
+            elif status == "error":
+                status_text = f"⚠️ Error: {info.get('error','')[:30]}"
+                tag = "error"
+            else:
+                status_text = status
+                tag = ""
+            
+            cur = info.get("raw_path", "") or "(none)"
+            resolved = ""
+            if info.get("resolved") is not None:
+                resolved = info["resolved"].name if info.get("file_exists") else "(missing)"
+            
+            sug = self._3d_manual_picks.get(fp_name) or info.get("suggested")
+            sug_text = sug.name if sug else ""
+            conf = ""
+            if fp_name in self._3d_manual_picks:
+                conf = "manual"
+            elif info.get("suggested") is not None:
+                pct = int(round(info["suggested_confidence"] * 100))
+                method = info["suggested_method"]
+                conf = f"{pct}% {method}"
+            
+            checkbox = "☑" if fp_name in self._3d_checked else "☐"
+            self._3d_tree.insert(
+                "", "end", text=checkbox,
+                values=(status_text, fp_name, cur, resolved, sug_text, conf),
+                tags=(tag,),
+            )
+    
+    def _on_3d_tree_click(self, event):
+        """Toggle the checkbox if the user clicked on the tree (#0) column."""
+        region = self._3d_tree.identify_region(event.x, event.y)
+        if region != "tree":
+            return
+        item = self._3d_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self._3d_tree.item(item, "values")
+        if not values:
+            return
+        fp_name = values[1]
+        if fp_name in self._3d_checked:
+            self._3d_checked.remove(fp_name)
+            self._3d_tree.item(item, text="☐")
+        else:
+            self._3d_checked.add(fp_name)
+            self._3d_tree.item(item, text="☑")
+    
+    def _on_3d_tree_double_click(self, event):
+        """Open the manual search dialog for the row under the cursor."""
+        region = self._3d_tree.identify_region(event.x, event.y)
+        # For a double-click we want to open the dialog regardless of
+        # which column the click landed in (except on the #0 column,
+        # which is already handled by the single-click toggle and would
+        # otherwise lead to a confusing combined toggle+open).
+        if region == "tree":
+            return
+        item = self._3d_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self._3d_tree.item(item, "values")
+        if not values:
+            return
+        fp_name = values[1]
+        self._3d_open_manual_search(fp_name)
+    
+    def _3d_select_all(self, only_suggested: bool = False):
+        for info in self._3d_results:
+            fp_name = info["fp_name"]
+            if only_suggested:
+                # Tick rows that have either a manual pick or an auto-suggestion
+                has_pick = fp_name in self._3d_manual_picks
+                has_sug = info.get("suggested") is not None
+                if has_pick or has_sug:
+                    self._3d_checked.add(fp_name)
+            else:
+                self._3d_checked.add(fp_name)
+        self._refresh_3d_tree()
+    
+    def _3d_select_none(self):
+        self._3d_checked.clear()
+        self._refresh_3d_tree()
+    
+    def _3d_manual_search_for_selection(self):
+        """Open the manual search dialog for the currently focused row."""
+        sel = self._3d_tree.selection()
+        if not sel:
+            messagebox.showinfo(
+                "No selection",
+                "Click a row to highlight it, then use Manual Search "
+                "(or just double-click the row).",
+            )
+            return
+        values = self._3d_tree.item(sel[0], "values")
+        if not values:
+            return
+        self._3d_open_manual_search(values[1])
+    
+    def _3d_open_manual_search(self, fp_name: str):
+        """Modal: search the models tree (or browse anywhere) and pick a model."""
+        models_root = self.current_models_root()
+        fp_dir = self.current_fp_dir()
+        
+        win = tk.Toplevel(self)
+        win.title(f"Find 3D Model — {fp_name}")
+        win.geometry("900x650")
+        win.configure(bg=COLORS['bg'])
+        win.transient(self)
+        win.grab_set()
+        
+        # Header
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=(12, 4))
+        ttk.Label(head, text=f"Find 3D model for: {fp_name}",
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(head, text=f"Models root: {models_root}",
+                  foreground=COLORS['text_muted']).pack(anchor="w", pady=(2, 0))
+        
+        # Search entry
+        srow = ttk.Frame(win)
+        srow.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(srow, text="🔍 Filter:").pack(side="left", padx=(0, 8))
+        search_var = tk.StringVar(value=fp_name)  # pre-fill with footprint name
+        entry = ttk.Entry(srow, textvariable=search_var, font=("Segoe UI", 10))
+        entry.pack(side="left", fill="x", expand=True)
+        
+        # Tree of models found
+        tree_frame = ttk.Labelframe(win, text="Models in library directory", padding=8)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        
+        cols = ("name", "type", "score", "path")
+        mtree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
+        mtree.pack(side="left", fill="both", expand=True)
+        mvsb = ttk.Scrollbar(tree_frame, orient="vertical", command=mtree.yview)
+        mvsb.pack(side="right", fill="y")
+        mtree.configure(yscrollcommand=mvsb.set)
+        
+        mtree.heading("name", text="Model name")
+        mtree.heading("type", text="Type")
+        mtree.heading("score", text="Match")
+        mtree.heading("path", text="Relative path")
+        mtree.column("name", width=240, anchor="w")
+        mtree.column("type", width=70, anchor="center")
+        mtree.column("score", width=80, anchor="center")
+        mtree.column("path", width=380, anchor="w")
+        
+        # Build full list once, then filter against it
+        all_models = []
+        if models_root.exists():
+            for f in models_root.rglob("*"):
+                if f.is_file() and f.suffix.lower() in (".step", ".stp", ".wrl"):
+                    all_models.append(f)
+        
+        fp_canon = _canon(fp_name)
+        
+        def populate(filter_text=""):
+            for it in mtree.get_children():
+                mtree.delete(it)
+            ft = filter_text.lower().strip()
+            
+            scored = []
+            for m in all_models:
+                stem_lower = m.stem.lower()
+                if ft and ft not in stem_lower and ft not in str(m).lower():
+                    continue
+                # Score against the footprint name so the closest match floats up
+                s = _score(_canon(m.stem), fp_canon)
+                scored.append((s, m))
+            
+            # Highest score first
+            scored.sort(key=lambda x: (-x[0], x[1].name.lower()))
+            
+            for s, m in scored[:500]:  # cap to keep the UI snappy
+                mtype = "STEP" if m.suffix.lower() in (".step", ".stp") else "WRL"
+                try:
+                    rel = m.relative_to(models_root)
+                except Exception:
+                    rel = m
+                pct = f"{int(round(s * 100))}%" if s > 0 else ""
+                mtree.insert("", "end", values=(m.stem, mtype, pct, str(rel)),
+                             tags=(str(m),))
+            
+            # Auto-select top result
+            kids = mtree.get_children()
+            if kids:
+                mtree.selection_set(kids[0])
+                mtree.see(kids[0])
+        
+        search_var.trace_add("write", lambda *a: populate(search_var.get()))
+        populate(search_var.get())
+        
+        # Currently-selected file label (for the Browse button)
+        chosen = {"path": None}
+        chosen_var = tk.StringVar(value="(no file chosen)")
+        chosen_row = ttk.Frame(win)
+        chosen_row.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Label(chosen_row, text="Selected:", foreground=COLORS['text_muted']
+                  ).pack(side="left")
+        ttk.Label(chosen_row, textvariable=chosen_var, foreground=COLORS['accent']
+                  ).pack(side="left", padx=8)
+        
+        def update_chosen_from_tree(*_):
+            sel = mtree.selection()
+            if not sel:
+                return
+            tags = mtree.item(sel[0], "tags")
+            if tags:
+                p = Path(tags[0])
+                chosen["path"] = p
+                chosen_var.set(p.name)
+        
+        mtree.bind("<<TreeviewSelect>>", update_chosen_from_tree)
+        update_chosen_from_tree()
+        
+        # Buttons
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=12)
+        
+        def do_browse():
+            init = models_root if models_root.exists() else Path.home()
+            f = filedialog.askopenfilename(
+                title="Browse for 3D model",
+                initialdir=str(init),
+                filetypes=[
+                    ("3D models", "*.step *.stp *.wrl"),
+                    ("STEP", "*.step *.stp"),
+                    ("VRML", "*.wrl"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if f:
+                p = Path(f)
+                chosen["path"] = p
+                chosen_var.set(p.name)
+        
+        def do_use():
+            if chosen["path"] is None:
+                messagebox.showwarning(
+                    "No selection",
+                    "Pick a model from the list, or click 'Browse' to choose any file.",
+                )
+                return
+            self._3d_manual_picks[fp_name] = chosen["path"]
+            self._3d_checked.add(fp_name)
+            # Patch the in-memory result so the row updates on refresh
+            for info in self._3d_results:
+                if info["fp_name"] == fp_name:
+                    info["suggested"] = chosen["path"]
+                    info["suggested_confidence"] = 1.0
+                    info["suggested_method"] = "manual"
+                    break
+            self._refresh_3d_tree()
+            win.destroy()
+        
+        def do_clear():
+            if fp_name in self._3d_manual_picks:
+                del self._3d_manual_picks[fp_name]
+            self._refresh_3d_tree()
+            win.destroy()
+        
+        ttk.Button(btns, text="📁 Browse for file…", command=do_browse
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="🔄 Clear manual pick", command=do_clear
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy
+                   ).pack(side="right", padx=4)
+        ttk.Button(btns, text="✅ Use selected model", command=do_use,
+                   style="Accent.TButton"
+                   ).pack(side="right", padx=4, ipadx=10, ipady=4)
+        
+        # Double-click any row in the tree to choose it
+        mtree.bind("<Double-1>", lambda e: (update_chosen_from_tree(), do_use()))
+        
+        # Focus on entry (text already pre-selected) so the user can type
+        # over it immediately if they want a different query.
+        entry.focus_set()
+        entry.select_range(0, "end")
+    
+    def _3d_fix_corrupted_paths_dialog(self):
+        """Preview backslash-corrupted (model "...") paths, let the user
+        confirm, repair them, then show a summary of what was changed."""
+        corrupted = [info for info in self._3d_results if info.get("corrupted")]
+        if not corrupted:
+            messagebox.showinfo(
+                "Nothing to fix",
+                "No corrupted backslash paths were found in the current scan.",
+            )
+            return
+        
+        win = tk.Toplevel(self)
+        win.title(f"Fix Corrupted 3D Paths — {len(corrupted)} footprints")
+        win.geometry("1100x650")
+        win.configure(bg=COLORS['bg'])
+        win.transient(self)
+        win.grab_set()
+        
+        # Header
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=(12, 4))
+        ttk.Label(head, text=f"Found {len(corrupted)} footprint(s) with backslash-corrupted 3D paths",
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(
+            head,
+            text=("Backslashes inside (model \"…\") strings get interpreted as escape "
+                  "sequences by KiCad's parser (\\3 → chr(3), invisible), which is "
+                  "why your paths displayed as '..d\\step\\…'. Fixing converts \\ "
+                  "to / and preserves all rotation / scale / offset transforms."),
+            foreground=COLORS['text_muted'], wraplength=1050, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        
+        # Tree of corrupted footprints with current/proposed path
+        tree_frame = ttk.Labelframe(win, text="Preview of changes", padding=8)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        
+        cols = ("footprint", "current", "fixed")
+        ftree = ttk.Treeview(tree_frame, columns=cols, show="tree headings", selectmode="extended")
+        ftree.grid(row=0, column=0, sticky="nsew")
+        fvsb = ttk.Scrollbar(tree_frame, orient="vertical", command=ftree.yview)
+        fvsb.grid(row=0, column=1, sticky="ns")
+        ftree.configure(yscrollcommand=fvsb.set)
+        fhsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=ftree.xview)
+        fhsb.grid(row=1, column=0, sticky="ew")
+        ftree.configure(xscrollcommand=fhsb.set)
+        
+        ftree.heading("#0", text="☑")
+        ftree.heading("footprint", text="Footprint")
+        ftree.heading("current", text="Current path (broken)")
+        ftree.heading("fixed", text="Proposed path (fixed)")
+        ftree.column("#0", width=44, anchor="center", stretch=False)
+        ftree.column("footprint", width=220, anchor="w")
+        ftree.column("current", width=380, anchor="w")
+        ftree.column("fixed", width=380, anchor="w")
+        
+        ftree.tag_configure("bad", foreground=COLORS['warning'])
+        
+        # All ticked by default; the user can untick any row to skip it
+        ticked = {}
+        for info in corrupted:
+            cur = info.get("raw_path", "") or ""
+            fixed = cur.replace("\\", "/")
+            iid = ftree.insert("", "end", text="☑",
+                               values=(info["fp_name"], cur, fixed),
+                               tags=("bad",))
+            ticked[iid] = info
+        
+        def on_click(event):
+            region = ftree.identify_region(event.x, event.y)
+            if region != "tree":
+                return
+            iid = ftree.identify_row(event.y)
+            if not iid or iid not in ticked:
+                return
+            cur_text = ftree.item(iid, "text")
+            ftree.item(iid, text=("☐" if cur_text == "☑" else "☑"))
+        
+        ftree.bind("<Button-1>", on_click)
+        
+        # Helper: tick / untick all
+        def set_all(value):
+            for iid in ticked:
+                ftree.item(iid, text=value)
+        
+        controls = ttk.Frame(win)
+        controls.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Button(controls, text="Select All", command=lambda: set_all("☑")
+                   ).pack(side="left", padx=2)
+        ttk.Button(controls, text="Select None", command=lambda: set_all("☐")
+                   ).pack(side="left", padx=2)
+        ttk.Label(controls, text="(Footprints with a \\ in the (model \"…\") path)",
+                  foreground=COLORS['text_muted']).pack(side="left", padx=12)
+        
+        # Apply / cancel
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=12)
+        
+        def do_apply():
+            chosen = [info for iid, info in ticked.items()
+                      if ftree.item(iid, "text") == "☑"]
+            if not chosen:
+                messagebox.showwarning(
+                    "Nothing ticked",
+                    "Tick at least one row to fix, or click Cancel.",
+                    parent=win,
+                )
+                return
+            if not messagebox.askyesno(
+                "Confirm",
+                f"Fix backslashes in {len(chosen)} footprint(s)?\n\n"
+                "Each file is rewritten in place. Rotations / scales / "
+                "offsets are preserved.",
+                parent=win,
+            ):
+                return
+            
+            # Apply
+            fixed_names = []
+            unchanged_names = []
+            errors = []
+            for info in chosen:
+                fp = info["fp_path"]
+                try:
+                    n = fix_corrupted_model_paths(fp)
+                    if n > 0:
+                        fixed_names.append((info["fp_name"], n))
+                    else:
+                        unchanged_names.append(info["fp_name"])
+                except Exception as e:
+                    errors.append(f"{info['fp_name']}: {e}")
+            
+            win.destroy()
+            
+            # Re-scan so the UI reflects the new state on disk
+            self.scan_3d_models_tab()
+            
+            # Summary popup
+            self._show_fix_corrupted_summary(fixed_names, unchanged_names, errors)
+        
+        ttk.Button(btns, text="Cancel", command=win.destroy
+                   ).pack(side="right", padx=4)
+        ttk.Button(btns, text="✅ Fix Ticked Footprints",
+                   command=do_apply, style="Accent.TButton"
+                   ).pack(side="right", padx=4, ipadx=10, ipady=4)
+    
+    def _show_fix_corrupted_summary(self, fixed, unchanged, errors):
+        """Modal summary after the user repairs corrupted paths."""
+        win = tk.Toplevel(self)
+        win.title("Path Fix Summary")
+        win.geometry("700x500")
+        win.configure(bg=COLORS['bg'])
+        win.transient(self)
+        win.grab_set()
+        
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=12)
+        if not errors:
+            ttk.Label(head, text="✅ Done", font=("Segoe UI", 14, "bold"),
+                      foreground=COLORS['success']).pack(anchor="w")
+        else:
+            ttk.Label(head, text="⚠ Done with errors", font=("Segoe UI", 14, "bold"),
+                      foreground=COLORS['warning']).pack(anchor="w")
+        
+        line = (f"Fixed {len(fixed)} footprint(s)"
+                + (f", {len(unchanged)} unchanged" if unchanged else "")
+                + (f", {len(errors)} error(s)" if errors else ""))
+        ttk.Label(head, text=line, foreground=COLORS['text_muted']
+                  ).pack(anchor="w", pady=(4, 0))
+        
+        body = ScrolledText(win, wrap="word", bg=COLORS['panel'],
+                            fg=COLORS['text'], font=("Consolas", 10))
+        body.pack(fill="both", expand=True, padx=12, pady=8)
+        
+        if fixed:
+            body.insert("end", f"📝 Fixed ({len(fixed)})\n", "h")
+            for name, n in fixed:
+                tail = f"  ({n} path{'s' if n != 1 else ''} cleaned)" if n != 1 else ""
+                body.insert("end", f"   • {name}{tail}\n")
+            body.insert("end", "\n")
+        if unchanged:
+            body.insert("end", f"➖ Unchanged ({len(unchanged)})\n", "h")
+            for name in unchanged:
+                body.insert("end", f"   • {name}\n")
+            body.insert("end", "\n")
+        if errors:
+            body.insert("end", f"❌ Errors ({len(errors)})\n", "h")
+            for err in errors:
+                body.insert("end", f"   • {err}\n")
+        
+        body.tag_configure("h", font=("Segoe UI", 11, "bold"),
+                           foreground=COLORS['accent'])
+        body.configure(state="disabled")
+        
+        ttk.Button(win, text="Close", command=win.destroy,
+                   style="Accent.TButton"
+                   ).pack(pady=(0, 12), ipadx=20, ipady=4)
+    
+    def _3d_apply_suggested(self):
+        """Write the suggested (or manually picked) model into each checked
+        footprint. Corrupted backslash paths are handled separately by
+        'Fix Corrupted Paths…' so this step is purely a search-and-replace."""
+        if not self._3d_checked:
+            messagebox.showwarning(
+                "Nothing selected",
+                "Tick at least one row, then click Apply. Tip: use "
+                "'Select All Suggested' to pick everything that has a match.",
+            )
+            return
+        
+        fp_dir = self.current_fp_dir()
+        personal_root = Path(self.personal.get()).expanduser()
+        use_relative = bool(self.rel_models.get())
+        
+        # Build worklist: fp_name -> Path
+        work = []
+        skipped_no_match = []
+        already_ok = []
+        for info in self._3d_results:
+            fp_name = info["fp_name"]
+            if fp_name not in self._3d_checked:
+                continue
+            chosen = self._3d_manual_picks.get(fp_name) or info.get("suggested")
+            if chosen is None:
+                skipped_no_match.append(fp_name)
+                continue
+            if info["status"] == "ok" and not self._3d_manual_picks.get(fp_name):
+                # Already pointing at a real file, nothing to do unless the
+                # user explicitly chose a different model manually.
+                already_ok.append(fp_name)
+                continue
+            work.append((fp_name, chosen))
+        
+        if not work:
+            msg = "Nothing to apply.\n\n"
+            if skipped_no_match:
+                msg += f"• {len(skipped_no_match)} checked row(s) have no matching model — use Manual Search.\n"
+            if already_ok:
+                msg += f"• {len(already_ok)} checked row(s) are already OK.\n"
+            messagebox.showinfo("Nothing to apply", msg)
+            return
+        
+        if not messagebox.askyesno(
+            "Confirm",
+            f"Update 3D model paths in {len(work)} footprint(s)?\n\n"
+            f"• Path format: {'relative' if use_relative else '${PERSONAL_LIB_DIR}'}\n"
+            f"• Existing transforms (rotate/scale/offset) are preserved.\n"
+            f"• {len(self._3d_manual_picks)} row(s) use a manual pick; the rest use the auto-suggestion.",
+        ):
+            return
+        
+        updated, errors = 0, []
+        for fp_name, chosen_path in work:
+            fp_path = fp_dir / f"{fp_name}.kicad_mod"
+            if not fp_path.exists():
+                errors.append(f"{fp_name}: file vanished")
+                continue
+            try:
+                if replace_model_path_in_footprint(
+                    fp_path, chosen_path, fp_dir, personal_root,
+                    use_relative=use_relative,
+                ):
+                    updated += 1
+            except Exception as e:
+                errors.append(f"{fp_name}: {e}")
+        
+        # Clear manual picks that were just applied
+        for fp_name, _ in work:
+            self._3d_manual_picks.pop(fp_name, None)
+        self._3d_checked.clear()
+        
+        # Re-scan to reflect what's now on disk
+        self.scan_3d_models_tab()
+        
+        msg = f"Updated {updated} footprint(s)."
+        if skipped_no_match:
+            msg += f"\nSkipped (no match): {len(skipped_no_match)}"
+        if already_ok:
+            msg += f"\nSkipped (already OK): {len(already_ok)}"
+        if errors:
+            msg += f"\n\nErrors:\n" + "\n".join(errors[:8])
+            if len(errors) > 8:
+                msg += f"\n…and {len(errors) - 8} more"
+            messagebox.showwarning("Done with issues", msg)
+        else:
+            messagebox.showinfo("Done", msg)
     
     def _create_bom_manager_tab(self, parent):
         """Create BOM Manager tab for importing Octopart BOMs and updating schematics."""
@@ -1592,6 +3019,10 @@ Features bug fixes and UI improvements.
         # Setup
         sym_path = ensure_paths(personal, self.sym_choice.get(), self.fp_choice.get())
         
+        # Open the per-library import log
+        log_obj = ImportLog(personal)
+        self._last_import_log = log_obj
+        
         self.set_status("⚙️ Gathering packages...", "")
         self.log_message("=" * 70, "STEP")
         self.log_message("STARTING IMPORT", "STEP")
@@ -1599,13 +3030,38 @@ Features bug fixes and UI improvements.
         self.log_message(f"Source: {source}", "INFO")
         self.log_message(f"Personal: {personal}", "INFO")
         self.log_message(f"Dry run: {self.dry_run.get()}", "INFO")
+        self.log_message(f"Import log: {log_obj.count()} package(s) on file", "INFO")
         
         # Gather packages
-        pkgs = gather_packages(source, recurse=self.recurse.get())
-        pkgs = prune_packages(pkgs, prefer=self.prefer_pkg.get())
+        all_pkgs = gather_packages(source, recurse=self.recurse.get())
+        all_pkgs = prune_packages(all_pkgs, prefer=self.prefer_pkg.get())
         
-        self.log_message(f"\nFound {len(pkgs)} packages to process", "OK")
-        self.sum_vars['packages'].set(str(len(pkgs)))
+        # Filter out already-imported packages (skip-list speed-up)
+        skipped_already = []
+        if self.skip_imported.get() and not self.overwrite.get():
+            pkgs = []
+            for kind, p in all_pkgs:
+                if log_obj.contains(kind, p):
+                    skipped_already.append((kind, p))
+                else:
+                    pkgs.append((kind, p))
+        else:
+            pkgs = list(all_pkgs)
+        
+        if skipped_already:
+            self.log_message(
+                f"\n⏩ Skipping {len(skipped_already)} package(s) already in import log "
+                f"(uncheck 'Skip already-imported' to force re-import)",
+                "SKIP",
+            )
+            # Show a few examples in the log
+            for kind, p in skipped_already[:5]:
+                self.log_message(f"   • {kind}: {p.name}", "SKIP")
+            if len(skipped_already) > 5:
+                self.log_message(f"   …and {len(skipped_already) - 5} more", "SKIP")
+        
+        self.log_message(f"\nFound {len(all_pkgs)} packages, processing {len(pkgs)} new", "OK")
+        self.sum_vars['packages'].set(str(len(all_pkgs)))
         
         # Process each package
         results = []
@@ -1631,6 +3087,10 @@ Features bug fixes and UI improvements.
                 )
                 results.append(res)
                 
+                # Remember in the import log only when not a dry run AND no errors
+                if not self.dry_run.get() and not res["errors"]:
+                    log_obj.remember(kind, path, summary=res)
+                
                 # Update display
                 status = "✅ OK" if not res['errors'] else "❌ ERR"
                 self.tree.insert("", "end", values=(
@@ -1646,8 +3106,13 @@ Features bug fixes and UI improvements.
                 self.log_message(f"ERROR: {e}", "ERR")
                 self.tree.insert("", "end", values=(path.name, "❌ ERR", "0", "0", "0", str(e)))
         
+        # Persist import log (additive — never lose what was already there)
+        if not self.dry_run.get():
+            log_obj.save()
+        
         # Update summary
-        total = {'fp_add': 0, 'fp_skip': 0, 'models': 0, 'sym_add': 0, 'sym_ren': 0, 'sym_ovr': 0, 'err': 0, 'new': 0}
+        total = {'fp_add': 0, 'fp_skip': 0, 'models': 0, 'sym_add': 0, 'sym_ren': 0,
+                 'sym_ovr': 0, 'err': 0, 'new': 0, 'paired': 0}
         for r in results:
             total['fp_add'] += r['footprints_imported']
             total['fp_skip'] += r['footprints_skipped']
@@ -1655,9 +3120,12 @@ Features bug fixes and UI improvements.
             total['sym_add'] += r['symbols_added']
             total['sym_ren'] += r['symbols_renamed']
             total['sym_ovr'] += r['symbols_overwritten']
+            total['paired'] += r['models_paired']
             total['err'] += len(r['errors'])
             if r['symbols_added'] > 0 or r['footprints_imported'] > 0:
                 total['new'] += 1
+        # Count of packages that were entirely skipped via the log
+        total['skipped_from_log'] = len(skipped_already)
         
         self.sum_vars['new'].set(str(total['new']))
         self.sum_vars['fp_added'].set(str(total['fp_add']))
@@ -1673,9 +3141,12 @@ Features bug fixes and UI improvements.
         self.log_message("IMPORT SUMMARY", "STEP")
         self.log_message("=" * 70, "STEP")
         self.log_message(f"\n📦 PACKAGES:", "INFO")
-        self.log_message(f"   • Found: {len(pkgs)} total", "INFO")
-        self.log_message(f"   • New: {total['new']} packages had new content", "NEW" if total['new'] > 0 else "SKIP")
-        self.log_message(f"   • Skipped: {len(pkgs) - total['new']} packages (no new content)", "SKIP")
+        self.log_message(f"   • Found: {len(all_pkgs)} total", "INFO")
+        if skipped_already:
+            self.log_message(f"   • Already imported: {len(skipped_already)} skipped via log", "SKIP")
+        self.log_message(f"   • Processed: {len(pkgs)}", "INFO")
+        self.log_message(f"   • New content: {total['new']} packages had new content", "NEW" if total['new'] > 0 else "SKIP")
+        self.log_message(f"   • No new content: {len(pkgs) - total['new']} packages", "SKIP")
         
         self.log_message(f"\n📚 SYMBOLS:", "INFO")
         self.log_message(f"   • Added: {total['sym_add']} new symbols", "NEW" if total['sym_add'] > 0 else "SKIP")
@@ -1690,14 +3161,18 @@ Features bug fixes and UI improvements.
         
         self.log_message(f"\n🎨 3D MODELS:", "INFO")
         self.log_message(f"   • Copied: {total['models']} new models", "NEW" if total['models'] > 0 else "SKIP")
+        self.log_message(f"   • Paired: {total['paired']} into footprints", "NEW" if total['paired'] > 0 else "SKIP")
         
         if total['err'] > 0:
             self.log_message(f"\n❌ ERRORS: {total['err']}", "ERR")
         
         # Final status
-        if total['new'] == 0:
+        if total['new'] == 0 and not skipped_already:
             self.log_message("\n✅ All packages up to date - nothing new to import", "OK")
-            self.set_status(f"✅ Complete - {len(pkgs)} packages checked, all up to date", "")
+            self.set_status(f"✅ Complete - {len(all_pkgs)} packages checked, all up to date", "")
+        elif total['new'] == 0 and skipped_already:
+            self.log_message(f"\n✅ All {len(all_pkgs)} packages already imported (used skip log)", "OK")
+            self.set_status(f"✅ Complete - {len(skipped_already)} skipped via log, nothing new", "")
         else:
             self.log_message(f"\n✅ IMPORT COMPLETE!", "OK")
             self.log_message(f"   Added {total['sym_add']} symbols + {total['fp_add']} footprints + {total['models']} 3D models", "OK")
@@ -1709,16 +3184,328 @@ Features bug fixes and UI improvements.
         self.save_prefs()
         
         # Done
-        msg = f"✅ Complete! Processed {len(pkgs)} packages" if not total['err'] else f"⚠️ Complete with {total['err']} errors"
+        if not total['err']:
+            msg = f"✅ Complete! Processed {len(pkgs)} new packages ({len(skipped_already)} skipped via log)"
+        else:
+            msg = f"⚠️ Complete with {total['err']} errors"
         self.set_status(msg, "")
         self.log_message(f"\n{'='*70}", "STEP")
         self.log_message(msg, "OK" if not total['err'] else "WARN")
         self.log_message(f"{'='*70}", "STEP")
         
-        # Switch to results tab
-        self.notebook.select(3)
+        # Switch to the Results tab (look it up by label so adding new tabs
+        # in future doesn't silently send the user to the wrong place)
+        self._switch_to_tab("Results")
         
-        messagebox.showinfo("Import Complete", msg)
+        # Detailed summary popup (lists actual part names, not just counts)
+        self._show_import_summary_dialog(results, total, all_pkgs, skipped_already, log_obj)
+
+    # ─── Helpers used by run() ───────────────────────────────────────────
+    def _switch_to_tab(self, label_substr: str):
+        """Switch the main notebook to whichever tab has ``label_substr``
+        in its label. Falls back to the last tab if not found."""
+        try:
+            n = self.notebook.index("end")
+            for i in range(n):
+                txt = self.notebook.tab(i, "text") or ""
+                if label_substr.lower() in txt.lower():
+                    self.notebook.select(i)
+                    return
+            self.notebook.select(n - 1)
+        except Exception:
+            pass
+    
+    def _show_import_summary_dialog(self, results, total, all_pkgs,
+                                    skipped_already, log_obj):
+        """Modal that lists every actual part imported, not just totals.
+        
+        Sections (only shown when non-empty):
+          • New Symbols     ─ exact symbol names added
+          • Renamed Symbols ─ "old → new"
+          • Overwritten     ─ symbol names that replaced existing
+          • New Footprints  ─ filenames
+          • 3D Models Copied
+          • Models Paired   ─ "footprint → model"
+          • Errors
+          • Skipped via log ─ packages skipped because they were already imported
+        """
+        win = tk.Toplevel(self)
+        win.title("Import Complete")
+        win.geometry("780x620")
+        win.configure(bg=COLORS['bg'])
+        win.transient(self)
+        win.grab_set()
+        
+        # Header
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=16, pady=12)
+        if total.get('err'):
+            ttk.Label(head, text=f"⚠ Import complete with {total['err']} error(s)",
+                      font=("Segoe UI", 14, "bold"),
+                      foreground=COLORS['warning']).pack(anchor="w")
+        else:
+            ttk.Label(head, text="✅ Import complete",
+                      font=("Segoe UI", 14, "bold"),
+                      foreground=COLORS['success']).pack(anchor="w")
+        
+        head_lines = [
+            f"Packages found in source: {len(all_pkgs)}",
+            f"Skipped via import log:  {len(skipped_already)}",
+            f"Processed this run:      {len(results)}",
+            f"Net new (added content): {total.get('new', 0)}",
+        ]
+        ttk.Label(head, text="\n".join(head_lines),
+                  foreground=COLORS['text_muted'],
+                  font=("Consolas", 10)).pack(anchor="w", pady=(6, 0))
+        
+        # Body — scrollable text with all the names
+        body = ScrolledText(win, wrap="word", bg=COLORS['panel'],
+                            fg=COLORS['text'], font=("Consolas", 10))
+        body.pack(fill="both", expand=True, padx=16, pady=8)
+        
+        body.tag_configure("h", font=("Segoe UI", 11, "bold"),
+                           foreground=COLORS['accent'])
+        body.tag_configure("muted", foreground=COLORS['text_muted'])
+        body.tag_configure("ok", foreground=COLORS['success'])
+        body.tag_configure("warn", foreground=COLORS['warning'])
+        body.tag_configure("err", foreground=COLORS['error'])
+        
+        # Aggregate name lists across all packages
+        added_syms = []
+        renamed_syms = []
+        overwritten_syms = []
+        added_fps = []
+        copied_models = []
+        paired_pairs = []
+        all_errors = []
+        for r in results:
+            added_syms.extend(r.get("symbols_added_names", []))
+            renamed_syms.extend(r.get("symbols_renamed_pairs", []))
+            overwritten_syms.extend(r.get("symbols_overwritten_names", []))
+            added_fps.extend(r.get("footprints_added_names", []))
+            copied_models.extend(r.get("models_copied_names", []))
+            paired_pairs.extend(r.get("models_paired_pairs", []))
+            for e in r.get("errors", []):
+                all_errors.append((Path(r.get("package", "")).name, e))
+        
+        def section(title, items, fmt=None, tag="ok"):
+            if not items:
+                return
+            body.insert("end", f"\n{title} ({len(items)})\n", "h")
+            for it in items:
+                line = fmt(it) if fmt else str(it)
+                body.insert("end", f"   • {line}\n", tag)
+        
+        # Sort within each list, dedup while preserving first occurrence
+        def _uniq(seq):
+            seen = set(); out = []
+            for x in seq:
+                key = x if isinstance(x, str) else tuple(x)
+                if key not in seen:
+                    seen.add(key); out.append(x)
+            return out
+        
+        added_syms_u = sorted(_uniq(added_syms), key=str.lower)
+        renamed_u = sorted(_uniq(renamed_syms), key=lambda p: p[0].lower())
+        overwritten_u = sorted(_uniq(overwritten_syms), key=str.lower)
+        added_fps_u = sorted(_uniq(added_fps), key=str.lower)
+        copied_models_u = sorted(_uniq(copied_models), key=str.lower)
+        paired_u = sorted(_uniq(paired_pairs), key=lambda p: p[0].lower())
+        
+        section("📚 New Symbols", added_syms_u, tag="ok")
+        section("📚 Renamed Symbols", renamed_u, fmt=lambda p: f"{p[0]}  →  {p[1]}", tag="warn")
+        section("📚 Overwritten Symbols", overwritten_u, tag="warn")
+        section("👣 New Footprints", added_fps_u, tag="ok")
+        section("🎲 3D Models Copied", copied_models_u, tag="ok")
+        section("🎲 Models Paired into Footprints", paired_u,
+                fmt=lambda p: f"{p[0]}  →  {p[1]}", tag="ok")
+        section("❌ Errors", all_errors, fmt=lambda p: f"[{p[0]}]  {p[1]}", tag="err")
+        
+        if skipped_already:
+            body.insert("end", f"\n⏩ Skipped via Import Log ({len(skipped_already)})\n", "h")
+            for kind, p in skipped_already[:50]:
+                body.insert("end", f"   • {kind}: {p.name}\n", "muted")
+            if len(skipped_already) > 50:
+                body.insert("end", f"   …and {len(skipped_already) - 50} more\n", "muted")
+        
+        # If everything was empty, say so explicitly
+        if not any([added_syms_u, renamed_u, overwritten_u, added_fps_u,
+                    copied_models_u, paired_u, all_errors]):
+            body.insert("end",
+                        "\n(Nothing new was added.)\n"
+                        "All processed packages either contained content "
+                        "that already exists in the library, or were skipped "
+                        "via the import log.\n", "muted")
+        
+        body.configure(state="disabled")
+        body.see("1.0")
+        
+        # Footer
+        footer = ttk.Frame(win)
+        footer.pack(fill="x", padx=16, pady=(0, 14))
+        log_msg = ""
+        if log_obj is not None:
+            log_msg = f"📜 Import log now contains {log_obj.count()} package(s)."
+        ttk.Label(footer, text=log_msg, foreground=COLORS['text_muted']
+                  ).pack(side="left")
+        ttk.Button(footer, text="Close", command=win.destroy,
+                   style="Accent.TButton"
+                   ).pack(side="right", ipadx=14, ipady=4)
+    
+    def show_import_log_gui(self):
+        """View / search / clear the per-library import log."""
+        personal = Path(self.personal.get()).expanduser() if self.personal.get() else None
+        if not personal or not personal.exists():
+            messagebox.showerror(
+                "No library selected",
+                "Pick a personal library directory first — the import log "
+                "is stored inside it.",
+            )
+            return
+        
+        log_obj = ImportLog(personal)
+        
+        win = tk.Toplevel(self)
+        win.title(f"Import Log — {personal.name}")
+        win.geometry("950x600")
+        win.configure(bg=COLORS['bg'])
+        win.transient(self)
+        win.grab_set()
+        
+        # Header
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=12)
+        ttk.Label(head, text=f"Import log: {log_obj.count()} package(s)",
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        ttk.Label(
+            head,
+            text=("Each entry remembers the path, size, and modification time "
+                  "of a package that was imported. Re-running an import will "
+                  "skip these. Removing an entry causes that package to be "
+                  "re-imported next time. Replacing the file on disk (different "
+                  "size or timestamp) also triggers re-import automatically."),
+            foreground=COLORS['text_muted'], wraplength=900, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(head, text=f"File: {log_obj.path}",
+                  foreground=COLORS['text_muted'],
+                  font=("Consolas", 9)).pack(anchor="w", pady=(4, 0))
+        
+        # Search row
+        srow = ttk.Frame(win)
+        srow.pack(fill="x", padx=12, pady=(0, 6))
+        ttk.Label(srow, text="🔍 Filter:").pack(side="left", padx=(0, 8))
+        sv = tk.StringVar()
+        ttk.Entry(srow, textvariable=sv).pack(side="left", fill="x", expand=True)
+        
+        # Tree
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        cols = ("kind", "name", "imported_at", "summary", "path")
+        ltree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                             selectmode="extended")
+        ltree.grid(row=0, column=0, sticky="nsew")
+        lvsb = ttk.Scrollbar(tree_frame, orient="vertical", command=ltree.yview)
+        lvsb.grid(row=0, column=1, sticky="ns")
+        ltree.configure(yscrollcommand=lvsb.set)
+        
+        ltree.heading("kind", text="Kind")
+        ltree.heading("name", text="Name")
+        ltree.heading("imported_at", text="Imported")
+        ltree.heading("summary", text="Summary")
+        ltree.heading("path", text="Path")
+        ltree.column("kind", width=60, anchor="center", stretch=False)
+        ltree.column("name", width=200, anchor="w")
+        ltree.column("imported_at", width=140, anchor="w")
+        ltree.column("summary", width=240, anchor="w")
+        ltree.column("path", width=300, anchor="w")
+        
+        # Cache: tree_item_id -> (kind, full path)
+        item_meta = {}
+        
+        def populate(filter_text=""):
+            for it in ltree.get_children():
+                ltree.delete(it)
+            item_meta.clear()
+            ft = filter_text.lower()
+            for fp_key, entry in sorted(
+                log_obj.list_entries(),
+                key=lambda kv: kv[1].get("imported_at", ""),
+                reverse=True,
+            ):
+                p = Path(entry.get("path", ""))
+                if ft and ft not in p.name.lower() and ft not in entry.get("path", "").lower():
+                    continue
+                summary = entry.get("summary", {}) or {}
+                summary_text = (
+                    f"{summary.get('symbols_added',0)}sym "
+                    f"+ {summary.get('footprints_imported',0)}fp "
+                    f"+ {summary.get('models_copied',0)}3d"
+                )
+                iid = ltree.insert("", "end", values=(
+                    entry.get("kind", ""),
+                    p.name,
+                    entry.get("imported_at", ""),
+                    summary_text,
+                    str(p),
+                ))
+                item_meta[iid] = (entry.get("kind", ""), p)
+        
+        populate()
+        sv.trace_add("write", lambda *a: populate(sv.get()))
+        
+        # Buttons
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=12)
+        
+        def remove_selected():
+            sel = ltree.selection()
+            if not sel:
+                messagebox.showinfo(
+                    "No selection",
+                    "Click rows in the table to select them, then "
+                    "'Remove Selected'.", parent=win)
+                return
+            if not messagebox.askyesno(
+                "Confirm",
+                f"Remove {len(sel)} entr{'ies' if len(sel) != 1 else 'y'} "
+                "from the import log?\n\nThose packages will be re-imported "
+                "next time you run the import.",
+                parent=win,
+            ):
+                return
+            for iid in sel:
+                kind, p = item_meta.get(iid, ("", Path("")))
+                if kind:
+                    log_obj.forget(kind, p)
+            log_obj.save()
+            populate(sv.get())
+            head.winfo_children()[0].config(text=f"Import log: {log_obj.count()} package(s)")
+        
+        def reset_all():
+            if not messagebox.askyesno(
+                "Reset Import Log",
+                f"Clear the entire import log ({log_obj.count()} package(s))?\n\n"
+                "Next import will re-process EVERY package found in the source "
+                "directory. This is the right move if you suspect packages have "
+                "changed without their timestamps updating, or if you want to "
+                "force-rebuild the library.",
+                parent=win,
+            ):
+                return
+            log_obj.reset()
+            log_obj.save()
+            populate(sv.get())
+            head.winfo_children()[0].config(text="Import log: 0 package(s)")
+        
+        ttk.Button(btns, text="🗑️ Remove Selected", command=remove_selected
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="🔥 Reset Entire Log…", command=reset_all
+                   ).pack(side="left", padx=4)
+        ttk.Button(btns, text="Close", command=win.destroy,
+                   style="Accent.TButton"
+                   ).pack(side="right", ipadx=14, ipady=4)
 
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2139,7 +3926,7 @@ Features bug fixes and UI improvements.
             def on_search(*args):
                 populate_models(search_var.get())
             
-            search_var.trace("w", on_search)
+            search_var.trace_add("write", on_search)
             
             # Buttons
             btn_frame = ttk.Frame(select_win)
@@ -2613,7 +4400,7 @@ Features bug fixes and UI improvements.
             """Filter tree on search."""
             populate_tree(search_var.get())
         
-        search_var.trace("w", on_search)
+        search_var.trace_add("write", on_search)
         
         # Selection buttons
         btn_frame1 = ttk.Frame(win)
@@ -2915,9 +4702,9 @@ Features bug fixes and UI improvements.
         output_frame = ttk.Labelframe(win, text="Validation Results", padding=12)
         output_frame.pack(fill="both", expand=True, padx=12, pady=(0,12))
         
-        output = scrolledtext.ScrolledText(output_frame, wrap="word", 
-                                          bg=COLORS['panel'], fg=COLORS['text'],
-                                          font=("Consolas", 10))
+        output = ScrolledText(output_frame, wrap="word",
+                              bg=COLORS['panel'], fg=COLORS['text'],
+                              font=("Consolas", 10))
         output.pack(fill="both", expand=True)
         
         # Status
@@ -3169,8 +4956,8 @@ Features bug fixes and UI improvements.
                     return Path(model_path).name
                 return "(none)"
             except:
-                return "(error)"
-        
+                return "(error reading file)"
+
         def populate_fp_tree(filter_text=""):
             """Populate footprint tree."""
             for item in fp_tree.get_children():
@@ -3210,7 +4997,7 @@ Features bug fixes and UI improvements.
                     update_selection_count()
         
         fp_tree.bind("<Button-1>", toggle_fp_selection)
-        search_var.trace("w", lambda *a: populate_fp_tree(search_var.get()))
+        search_var.trace_add("write", lambda *a: populate_fp_tree(search_var.get()))
         
         # Selection buttons
         sel_btn_frame = ttk.Frame(left_frame)
@@ -3298,7 +5085,7 @@ Features bug fixes and UI improvements.
         preview_frame = ttk.Labelframe(right_frame, text="Preview", padding=12)
         preview_frame.pack(fill="both", expand=True, pady=(0,12))
         
-        preview_text = scrolledtext.ScrolledText(preview_frame, wrap="word", height=15,
+        preview_text = ScrolledText(preview_frame, wrap="word", height=15,
                                                  bg=COLORS['panel'], fg=COLORS['text'],
                                                  font=("Consolas", 9))
         preview_text.pack(fill="both", expand=True)
@@ -3392,8 +5179,16 @@ Features bug fixes and UI improvements.
                 try:
                     content = fp.read_text(encoding='utf-8')
                     
-                    # Remove existing model references
-                    content = re.sub(r'\s*\(model\s+"[^"]*"[^)]*\)', '', content)
+                    # Remove existing model references (handles multi-line blocks)
+                    blocks = _extract_model_blocks(content)
+                    for start, end, _, _ in reversed(blocks):
+                        ws_start = start
+                        while ws_start > 0 and content[ws_start - 1] in (' ', '\t'):
+                            ws_start -= 1
+                        ws_end = end
+                        if ws_end < len(content) and content[ws_end] == '\n':
+                            ws_end += 1
+                        content = content[:ws_start] + content[ws_end:]
                     
                     # Add new model
                     if content.rstrip().endswith(')'):
@@ -4033,10 +5828,10 @@ License: MIT
             try:
                 with open(PREFS_FILE, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         return {}
-    
+
     def save_prefs(self):
         """Save preferences to JSON file."""
         prefs = {
@@ -4048,36 +5843,20 @@ License: MIT
             "rel_models": self.rel_models.get(),
             "footprint_nickname": self.nick.get(),
             "autoset": self.autoset.get(),
+            "skip_imported": self.skip_imported.get(),
             "recent_sources": self.recent_sources,
             "recent_personal": self.recent_personal,
         }
         try:
             with open(PREFS_FILE, 'w') as f:
                 json.dump(prefs, f, indent=2)
-        except:
+        except Exception:
             pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS (not in App class)
 # ═══════════════════════════════════════════════════════════════════════════
-
-def list_symbols(sym_path: Path) -> List[Tuple[str, str]]:
-    """List all symbols in a symbol file."""
-    if not sym_path.exists():
-        return []
-    txt = sym_path.read_text(encoding="utf-8", errors="ignore")
-    return parse_symbol_blocks(txt)
-
-
-def models_in_footprint(mod_path: Path) -> List[str]:
-    """Extract model paths from footprint."""
-    txt = mod_path.read_text(encoding="utf-8", errors="ignore")
-    models = []
-    for m in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt):
-        models.append(m.group(1) or m.group(2))
-    return models
-
 
 def standardize_mpn_fields(sym_path: Path, remove_old_field: bool = False, log=lambda *a: None) -> int:
     """
@@ -4213,102 +5992,6 @@ def standardize_mpn_fields(sym_path: Path, remove_old_field: bool = False, log=l
         log("No changes needed - all symbols already have MPN or no part numbers found")
     
     return changed_count
-
-
-def fix_footprint_models(fp_dir: Path, models_root: Path, sym_path: Optional[Path] = None,
-                        dry_run: bool = False, add_if_missing: bool = True,
-                        prefer_ext: str = "step", force_relative: bool = False) -> Tuple[int, int]:
-    """Fix 3D model paths in footprints."""
-    all_idx = _available_models_index(models_root)
-    changed, total = 0, 0
-    
-    for mod in fp_dir.glob("*.kicad_mod"):
-        total += 1
-        txt = mod.read_text(encoding="utf-8", errors="ignore")
-        orig = txt
-        
-        # Rewrite existing models
-        def chooser(path_str):
-            return _choose_local_model_smart(all_idx, path_str, prefer_ext)
-        
-        if force_relative:
-            def make_rel(local_path):
-                try:
-                    return os.path.relpath(local_path, start=fp_dir).replace("\\", "/")
-                except:
-                    return local_path.name
-            txt = _rewrite_all_models(txt, chooser, make_rel)
-        else:
-            txt = _rewrite_all_models(txt, chooser, None)
-        
-        # Add missing?
-        if add_if_missing and not re.search(r'\(model\s+', txt):
-            best = _choose_local_model_smart(all_idx, mod.stem, prefer_ext)
-            if best:
-                if force_relative:
-                    try:
-                        rel = os.path.relpath(best, start=fp_dir).replace("\\", "/")
-                    except:
-                        rel = best.name
-                    model_str = f'(model "{rel}")'
-                else:
-                    sub = "step" if best.suffix.lower() in (".step", ".stp") else "wrl"
-                    model_str = f'(model "${{PERSONAL_LIB_DIR}}/3d/{sub}/{best.name}")'
-                
-                if txt.rstrip().endswith(')'):
-                    txt = txt.rstrip()[:-1] + f"\n  {model_str}\n)"
-                else:
-                    txt = txt + f"\n  {model_str}\n"
-        
-        if txt != orig:
-            changed += 1
-            if not dry_run:
-                mod.write_text(txt, encoding="utf-8")
-    
-    return changed, total
-
-
-def _rewrite_all_models(txt: str, chooser, make_rel=None):
-    """Rewrite model paths in footprint text."""
-    def repl(m):
-        path = m.group(1) or m.group(2)
-        local = chooser(path)
-        if local:
-            if make_rel:
-                relpath = make_rel(local)
-                return f'(model "{relpath}"'
-            else:
-                sub = "step" if local.suffix.lower() in (".step",".stp") else "wrl"
-                return f'(model "${{PERSONAL_LIB_DIR}}/3d/{sub}/{local.name}"'
-        return m.group(0)
-    return re.sub(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', repl, txt)
-
-
-def _update_kicad_path_variable(personal_root: Path, log=lambda *a: None) -> List[Path]:
-    """Update PERSONAL_LIB_DIR in KiCad config files."""
-    updated = []
-    # This would need to find and modify kicad_common.json files
-    # Simplified for now
-    log("Path variable update not yet implemented")
-    return updated
-
-
-def _rewrite_fp_lib_table(personal_root: Path, log=lambda *a: None) -> List[Path]:
-    """Rewrite fp-lib-table to use variables."""
-    changed = []
-    # This would find and modify fp-lib-table files
-    # Simplified for now
-    log("fp-lib-table rewrite not yet implemented")
-    return changed
-
-
-def _rewrite_models(personal_root: Path, log=lambda *a: None) -> int:
-    """Rewrite 3D model paths to be relative."""
-    count = 0
-    # This would process all .kicad_mod files
-    # Simplified for now
-    log("Model path rewrite not yet implemented")
-    return count
 
 
 def _col_to_index(col: str) -> int:
