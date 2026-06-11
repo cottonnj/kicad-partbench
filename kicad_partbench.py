@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KiCad Library Tool v5.6
+KiCad Library Tool v6.0
 ═══════════════════════════════════════════════════════════════════════════════
 Modern, portable tool for managing KiCad component libraries.
 
@@ -8,10 +8,55 @@ Modern, portable tool for managing KiCad component libraries.
 • Intelligent duplicate detection (content-based hashing)
 • Automatic 3D model pairing  
 • 3D Models tab — validate, locate, and repair model paths across the library
+• BOM Manager — sync Octopart BOMs to schematics
+• Passives tab — library-driven MPN/LCSC assignment for R/C/L
 • Library management tools
 • Modern dark theme, no external dependencies
 
-Version: 5.6.0 | Date: 2025-11-08 | License: MIT
+Version: 6.0.0 | Date: 2026-06-08 | License: MIT
+
+Changes since 5.8:
+  • NEW : Package field is now a combobox with auto-complete. Drops down
+          to show the standard KiCad SMD package strings for the current
+          part type (R_0603_1608Metric etc.) plus every package string
+          already used in the library. Editable — type any custom package
+          name not in the list. Custom names you save auto-populate next
+          time you open a form.
+
+Changes since 5.7:
+  • NEW : Passives tab — "Save All Complete to Library" walkthrough.
+          Scans the table, finds every unique (type, value, package, MPN)
+          combination that has Value+Footprint+MPN populated, dedups
+          against the existing library, then walks you through each one
+          in a pre-filled form. Required fields are just Value/Package/MPN
+          — LCSC and all spec fields are optional. Buttons: Save & Next,
+          Skip, Save All Remaining (minimal), Cancel.
+  • NEW : Status filter in the Passives table — All / Missing MPN /
+          Missing LCSC / Missing MPN or LCSC / Has MPN and LCSC /
+          Missing Footprint. Intersects with Type and text filters.
+  • UI  : "💾 Save to Library" moved out of the Manual Entry section
+          into its own dedicated section so it's actually findable.
+
+Changes since 5.6:
+  • NEW : "Passives" tab — automate the per-component MPN/LCSC chore for
+          resistors, capacitors, and inductors. Scans the whole project
+          (hierarchical sheets included), groups passives by normalized
+          (Value, Footprint), and applies MPN+LCSC+supporting fields
+          (Tolerance, Voltage, Dielectric, Power, Isat, etc.) to every
+          checked instance in one click.
+  • NEW : Global passives library at ~/.kicad-library-tool/passives.json.
+          Saved entries carry full spec metadata (voltage, dielectric,
+          tolerance, power, Isat, DCR, core, etc.) so the dropdown can
+          disambiguate two parts that share Value+Footprint but differ in
+          the underlying spec (e.g. 1uF 0603 16V X7R vs 1uF 0603 50V C0G).
+  • NEW : Library Manager modal (Add / Edit / Remove / Import / Export).
+  • NEW : Unit normalizer — uF/UF/uf/µF all match; k/K folded; m (milli)
+          and M (mega) are kept case-distinct; old-style 4k7 → 4.7k.
+  • NEW : Heterogeneous-selection block — can't accidentally apply one
+          MPN to a mix of different values. Edit Row… escape hatch for
+          forcibly changing any field on a single component.
+  • NEW : Pre-write overwrite confirmation showing every existing value
+          that would be replaced, in one batch dialog.
 
 Changes since 5.5:
   • FIX : Imported footprints had Windows backslashes left in 3D model paths
@@ -987,6 +1032,132 @@ def _windows_kicad_config_dirs():
                     paths.append(p)
     return sorted(paths, key=lambda p: p.name, reverse=True)
 
+def _all_kicad_config_dirs():
+    """Cross-platform KiCad config dirs (and their version subdirs).
+
+    Unlike _windows_kicad_config_dirs(), this also covers macOS and Linux so the
+    nickname auto-detector works for anyone the tool is shared with."""
+    roots = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "kicad")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "kicad")
+    roots.append(Path.home() / "Library" / "Preferences" / "kicad")  # macOS
+    roots.append(Path.home() / ".config" / "kicad")                  # Linux/XDG
+    out, seen = [], set()
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            subs = sorted([p for p in root.iterdir() if p.is_dir()],
+                          key=lambda p: p.name, reverse=True)
+            for cand in [root] + subs:
+                rp = cand.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    out.append(cand)
+        except Exception:
+            pass
+    return out
+
+
+def _kicad_path_vars(personal_root: Path):
+    """Collect KiCad path-substitution variables from kicad_common.json files so
+    that ${VAR}-style URIs in fp-lib-table can be expanded."""
+    vars_map = {}
+    for d in _all_kicad_config_dirs():
+        cfg = d / "kicad_common.json"
+        try:
+            if cfg.exists():
+                data = json.loads(cfg.read_text(encoding="utf-8", errors="ignore"))
+                for k, v in (data.get("path", {}) or {}).items():
+                    if isinstance(v, str) and k not in vars_map:
+                        vars_map[k] = v
+        except Exception:
+            pass
+    # If the user hasn't defined PERSONAL_LIB_DIR, assume it points at this library.
+    vars_map.setdefault("PERSONAL_LIB_DIR", str(personal_root))
+    return vars_map
+
+
+def _expand_kicad_uri(uri: str, vars_map: dict) -> str:
+    """Expand a fp-lib-table URI into a filesystem path: handle file://,
+    ${VAR}/$VAR substitution (KiCad vars first, then OS env), and ~."""
+    s = uri.replace("\\", "/").strip()
+    if s.lower().startswith("file://"):
+        s = s[7:]
+
+    def _sub(m):
+        name = m.group(1) or m.group(2)
+        if name in vars_map:
+            return vars_map[name]
+        return os.environ.get(name, m.group(0))
+
+    s = re.sub(r'\$\{([A-Za-z0-9_]+)\}|\$([A-Za-z0-9_]+)', _sub, s)
+    return os.path.expanduser(s)
+
+
+def _detect_fp_nickname(personal_root: Path, pretty_name: str = "footprints.pretty"):
+    """Determine the footprint-library nickname KiCad uses for this library's
+    .pretty directory.
+
+    KiCad references footprints as <nickname>:<Footprint>, where <nickname> is the
+    name registered for the .pretty folder in fp-lib-table -- NOT the .kicad_sym
+    filename, and NOT a value this tool can invent. So we read the user's
+    fp-lib-table(s) and find the entry whose URI resolves to this .pretty dir.
+
+    Falls back to the .pretty folder stem (KiCad's GUI default when you Add a
+    library) if no registered entry is found. Returns None only when no library
+    path is set."""
+    if not personal_root:
+        return None
+    try:
+        target = (Path(personal_root) / pretty_name).resolve()
+    except Exception:
+        return None
+
+    vars_map = _kicad_path_vars(Path(personal_root))
+    target_norm = os.path.normcase(os.path.normpath(str(target)))
+
+    # fp-lib-table candidates: global config dirs, the library dir itself, and its
+    # parent (covers project-local tables).
+    tables = [d / "fp-lib-table" for d in _all_kicad_config_dirs()]
+    tables.append(Path(personal_root) / "fp-lib-table")
+    tables.append(Path(personal_root).parent / "fp-lib-table")
+
+    for tbl in tables:
+        try:
+            if not tbl.exists():
+                continue
+            txt = tbl.read_text(encoding="utf-8", errors="ignore")
+            # KiCad writes exactly one (name ...) then one (uri ...) per (lib ...),
+            # so positional pairing is reliable.
+            names = re.findall(r'\(name\s+"([^"]*)"\)', txt)
+            uris = re.findall(r'\(uri\s+"([^"]*)"\)', txt)
+            for name, uri in zip(names, uris):
+                cand = _expand_kicad_uri(uri, vars_map)
+                try:
+                    cp = Path(cand)
+                    if cp.exists() and cp.resolve().samefile(target):
+                        return name
+                except Exception:
+                    pass
+                # String comparison fallback: a shared library's paths may not
+                # exist on the machine reading the table, but still match by value.
+                if os.path.normcase(os.path.normpath(cand)) == target_norm:
+                    return name
+        except Exception:
+            pass
+
+    # Fallback: KiCad pre-fills the nickname from the .pretty folder stem.
+    stem = pretty_name
+    if stem.lower().endswith(".pretty"):
+        stem = stem[:-len(".pretty")]
+    return stem or None
+
+
 def _update_kicad_path_variable(personal_root: Path, var_name="PERSONAL_LIB_DIR", log=lambda *a: None):
     dirs = _windows_kicad_config_dirs()
     updated = []
@@ -1431,7 +1602,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         
-        self.title("⚡ KiCad Library Tool 5.6")
+        self.title("⚡ KiCad Library Tool 6.0")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         
@@ -1442,6 +1613,10 @@ class App(tk.Tk):
         self.source = tk.StringVar()
         self.personal = tk.StringVar()
         self.nick = tk.StringVar(value="Personal_Footprints")
+        # When on, the footprint nickname is auto-detected from the user's
+        # fp-lib-table whenever the personal library is selected. Off = the
+        # value typed in the Footprint Nickname field is used verbatim.
+        self.auto_nick = tk.BooleanVar(value=True)
         self.autoset = tk.BooleanVar(value=True)
         self.overwrite = tk.BooleanVar(value=False)
         self.dup_handling = tk.StringVar(value="skip")  # skip, replace, or rename
@@ -1475,6 +1650,14 @@ class App(tk.Tk):
         self.models_root.set(prefs.get("models_root", ""))
         self.rel_models.set(prefs.get("rel_models", True))
         self.nick.set(prefs.get("footprint_nickname", "Personal_Footprints"))
+        self.auto_nick.set(prefs.get("auto_detect_nickname", True))
+        # Re-detect the nickname if the .pretty folder choice changes, and once on
+        # startup for the restored library (deferred so widgets exist first).
+        try:
+            self.fp_choice.trace_add("write", lambda *a: self.detect_and_set_nickname())
+            self.after(300, self.detect_and_set_nickname)
+        except Exception:
+            pass
         self.autoset.set(prefs.get("autoset", True))
         self.skip_imported.set(prefs.get("skip_imported", True))
         self.recent_sources = prefs.get("recent_sources", [])[:10]
@@ -1539,6 +1722,7 @@ class App(tk.Tk):
         tab_library = ttk.Frame(notebook)
         tab_3d = ttk.Frame(notebook)
         tab_bom = ttk.Frame(notebook)
+        tab_passives = ttk.Frame(notebook)
         tab_settings = ttk.Frame(notebook)
         tab_results = ttk.Frame(notebook)
         
@@ -1546,6 +1730,7 @@ class App(tk.Tk):
         notebook.add(tab_library, text=" 📚 Library ")
         notebook.add(tab_3d, text=" 🎲 3D Models ")
         notebook.add(tab_bom, text=" 📋 BOM Manager ")
+        notebook.add(tab_passives, text=" 🧩 Passives ")
         notebook.add(tab_settings, text=" ⚙️ Settings ")
         notebook.add(tab_results, text=" 📊 Results ")
         
@@ -1553,6 +1738,7 @@ class App(tk.Tk):
         self._create_library_tab(tab_library)
         self._create_3d_models_tab(tab_3d)
         self._create_bom_manager_tab(tab_bom)
+        self._create_passives_tab(tab_passives)
         self._create_settings_tab(tab_settings)
         self._create_results_tab(tab_results)
         
@@ -2736,7 +2922,22 @@ class App(tk.Tk):
         lf.grid_columnconfigure(1, weight=1)
         
         ttk.Label(lf, text="Footprint Nickname:").grid(row=0, column=0, sticky="e", padx=(0,8), pady=6)
-        ttk.Entry(lf, textvariable=self.nick).grid(row=0, column=1, sticky="ew", padx=4, pady=6)
+        nick_row = ttk.Frame(lf)
+        nick_row.grid(row=0, column=1, sticky="ew", padx=4, pady=6)
+        nick_row.grid_columnconfigure(0, weight=1)
+        nick_entry = ttk.Entry(nick_row, textvariable=self.nick)
+        nick_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(
+            nick_row, text="Auto-detect", variable=self.auto_nick,
+            command=lambda: self.detect_and_set_nickname(force=True) if self.auto_nick.get() else None
+        ).grid(row=0, column=1, padx=(8,0))
+        ttk.Button(
+            nick_row, text="Detect",
+            command=lambda: self.detect_and_set_nickname(force=True)
+        ).grid(row=0, column=2, padx=(6,0))
+        # Physical typing means the user wants a manual value -- turn auto off so it
+        # sticks. Programmatic .set() does not fire KeyRelease, so detection is safe.
+        nick_entry.bind("<KeyRelease>", lambda e: self.auto_nick.set(False))
         
         ttk.Label(lf, text="Deduplication Mode:").grid(row=1, column=0, sticky="e", padx=(0,8), pady=6)
         ttk.Combobox(lf, textvariable=self.dedupe_mode, 
@@ -2947,6 +3148,27 @@ Features bug fixes and UI improvements.
                 self.recent_sources.insert(0, p)
                 self.recent_sources = self.recent_sources[:10]
     
+    def detect_and_set_nickname(self, force=False):
+        """Populate the Footprint Nickname field from the user's fp-lib-table.
+
+        Honors the Auto-detect toggle unless force=True (the manual Detect button
+        or enabling the checkbox). Does nothing if no library is selected."""
+        if not force and not self.auto_nick.get():
+            return
+        pstr = self.personal.get()
+        if not pstr:
+            return
+        try:
+            detected = _detect_fp_nickname(Path(pstr).expanduser(), self.fp_choice.get())
+        except Exception:
+            detected = None
+        if detected and detected != self.nick.get():
+            self.nick.set(detected)
+            try:
+                self.log_message(f"[Nickname] Using footprint library nickname '{detected}'", "INFO")
+            except Exception:
+                pass
+
     def pick_personal(self):
         """Pick personal library directory."""
         init_dir = self.personal.get() or str(Path.home())
@@ -2957,6 +3179,7 @@ Features bug fixes and UI improvements.
                 self.recent_personal.insert(0, p)
                 self.recent_personal = self.recent_personal[:10]
             self.refresh_personal_candidates()
+            self.detect_and_set_nickname()
     
     def pick_models_root(self):
         """Pick 3D models root directory."""
@@ -5842,6 +6065,7 @@ License: MIT
             "models_root": self.models_root.get(),
             "rel_models": self.rel_models.get(),
             "footprint_nickname": self.nick.get(),
+            "auto_detect_nickname": self.auto_nick.get(),
             "autoset": self.autoset.get(),
             "skip_imported": self.skip_imported.get(),
             "recent_sources": self.recent_sources,
@@ -6503,6 +6727,1794 @@ def apply_bom_to_schematics(matches: List[dict]) -> dict:
         'updated': updated_count,
         'files_modified': len(files_to_update)
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PASSIVES TAB v1 — Library-driven MPN/LCSC field assignment for R/C/L
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Workflow:
+#   1. Pick a schematic file (or .kicad_pro). Tool walks all hierarchical
+#      sheets and gathers every R/C/L instance.
+#   2. Table groups passives by (value_normalized, footprint_short) so
+#      identical parts cluster — check N rows at once, apply one MPN/LCSC.
+#   3. For Apply: either type MPN+LCSC manually, or pick a saved library
+#      entry from the searchable dropdown. Library is filtered to entries
+#      matching the (value, package) of the checked rows.
+#   4. Save-to-library button captures the current MPN/LCSC plus user-typed
+#      metadata (Voltage, Dielectric, etc.) into the global JSON library.
+#   5. Library Manager… button opens a modal for browsing, editing, and
+#      importing/exporting the library.
+#
+# File written to schematic, per part type:
+#   R: MPN, LCSC, Tolerance, Power, Voltage, Type, Manufacturer
+#   C: MPN, LCSC, Tolerance, Voltage, Dielectric, Type, Manufacturer
+#   L: MPN, LCSC, Tolerance, Isat, Irms, DCR, SRF, Q, Core, Manufacturer
+#
+# Library file: ~/.kicad-library-tool/passives.json
+# Schematic backup: <file>.kicad_sch.bak before any write.
+# ═══════════════════════════════════════════════════════════════════════════
+
+PASSIVES_LIB_DIR  = Path.home() / ".kicad-library-tool"
+PASSIVES_LIB_FILE = PASSIVES_LIB_DIR / "passives.json"
+
+# Per-type field map. Keys = (library_field_name, kicad_property_name).
+# Order matters — properties are written in this order.
+PASSIVE_FIELD_MAP: Dict[str, List[Tuple[str, str]]] = {
+    'R': [('mpn','MPN'), ('lcsc','LCSC'), ('tolerance','Tolerance'),
+          ('power','Power'), ('voltage','Voltage'), ('type','Type'),
+          ('manufacturer','Manufacturer')],
+    'C': [('mpn','MPN'), ('lcsc','LCSC'), ('tolerance','Tolerance'),
+          ('voltage','Voltage'), ('dielectric','Dielectric'),
+          ('type','Type'), ('manufacturer','Manufacturer')],
+    'L': [('mpn','MPN'), ('lcsc','LCSC'), ('tolerance','Tolerance'),
+          ('isat','Isat'), ('irms','Irms'), ('dcr','DCR'), ('srf','SRF'),
+          ('q','Q'), ('core','Core'), ('manufacturer','Manufacturer')],
+}
+
+PASSIVE_TYPE_LABEL = {'R': 'Resistor', 'C': 'Capacitor', 'L': 'Inductor'}
+PASSIVE_LIB_KEY    = {'R': 'resistors', 'C': 'capacitors', 'L': 'inductors'}
+
+# Form-field layout per part type. Each entry is (key, label, hint).
+# Used by both the single-entry dialog and the "Save All Complete" walkthrough.
+PASSIVE_FORM_FIELDS: Dict[str, List[Tuple[str, str, str]]] = {
+    'R': [('value','Value','e.g. 10k'),
+          ('package','Package (full KiCad footprint)','e.g. Resistor_SMD:R_0603_1608Metric'),
+          ('tolerance','Tolerance','e.g. 1%'),
+          ('power','Power','e.g. 0.1W'),
+          ('voltage','Voltage','e.g. 75V'),
+          ('type','Type','Thick film / Thin film / Wirewound / Current sense'),
+          ('manufacturer','Manufacturer','e.g. Yageo'),
+          ('mpn','MPN','exact part number'),
+          ('lcsc','LCSC','e.g. C25804'),
+          ('datasheet','Datasheet URL',''),
+          ('notes','Notes','optional')],
+    'C': [('value','Value','e.g. 1uF'),
+          ('package','Package (full KiCad footprint)','e.g. Capacitor_SMD:C_0603_1608Metric'),
+          ('tolerance','Tolerance','e.g. 10%'),
+          ('voltage','Voltage','e.g. 16V'),
+          ('dielectric','Dielectric','C0G/NP0, X7R, X5R, X8R, Y5V, Tantalum, Polymer, Electrolytic'),
+          ('type','Type','MLCC / Tantalum / Polymer / Aluminum Electrolytic / Film'),
+          ('manufacturer','Manufacturer','e.g. Murata'),
+          ('mpn','MPN','exact part number'),
+          ('lcsc','LCSC','e.g. C28323'),
+          ('datasheet','Datasheet URL',''),
+          ('notes','Notes','optional')],
+    'L': [('value','Value','e.g. 4.7uH'),
+          ('package','Package (full KiCad footprint)',''),
+          ('tolerance','Tolerance','e.g. 20%'),
+          ('isat','Saturation Current (Isat)','e.g. 5.4A'),
+          ('irms','RMS Current (Irms)','e.g. 4.6A'),
+          ('dcr','DC Resistance (DCR)','e.g. 26mΩ'),
+          ('srf','Self-Resonant Freq (SRF)','e.g. 50MHz'),
+          ('q','Q Factor',''),
+          ('core','Core Material','Ferrite / Iron powder / Air-core'),
+          ('manufacturer','Manufacturer',''),
+          ('mpn','MPN','exact part number'),
+          ('lcsc','LCSC','e.g. C2845796'),
+          ('datasheet','Datasheet URL',''),
+          ('notes','Notes','optional')],
+}
+
+# Standard KiCad SMD footprint paths per part type. The combobox in the
+# library-entry form drops down with these plus any extras already present
+# in the user's library. Editable so users can type any custom name —
+# custom names auto-populate the dropdown on next open.
+COMMON_PASSIVE_PACKAGES: Dict[str, List[str]] = {
+    'R': [
+        'Resistor_SMD:R_01005_0402Metric',
+        'Resistor_SMD:R_0201_0603Metric',
+        'Resistor_SMD:R_0402_1005Metric',
+        'Resistor_SMD:R_0603_1608Metric',
+        'Resistor_SMD:R_0805_2012Metric',
+        'Resistor_SMD:R_1206_3216Metric',
+        'Resistor_SMD:R_1210_3225Metric',
+        'Resistor_SMD:R_1218_3246Metric',
+        'Resistor_SMD:R_2010_5025Metric',
+        'Resistor_SMD:R_2512_6332Metric',
+        # HandSolder variants (popular for prototyping)
+        'Resistor_SMD:R_0402_1005Metric_Pad0.72x0.64mm_HandSolder',
+        'Resistor_SMD:R_0603_1608Metric_Pad0.98x0.95mm_HandSolder',
+        'Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder',
+        'Resistor_SMD:R_1206_3216Metric_Pad1.30x1.75mm_HandSolder',
+        'Resistor_SMD:R_1210_3225Metric_Pad1.30x2.65mm_HandSolder',
+    ],
+    'C': [
+        # Ceramic chip caps
+        'Capacitor_SMD:C_01005_0402Metric',
+        'Capacitor_SMD:C_0201_0603Metric',
+        'Capacitor_SMD:C_0402_1005Metric',
+        'Capacitor_SMD:C_0603_1608Metric',
+        'Capacitor_SMD:C_0805_2012Metric',
+        'Capacitor_SMD:C_1206_3216Metric',
+        'Capacitor_SMD:C_1210_3225Metric',
+        'Capacitor_SMD:C_1812_4532Metric',
+        'Capacitor_SMD:C_1825_4564Metric',
+        'Capacitor_SMD:C_2220_5650Metric',
+        # HandSolder variants
+        'Capacitor_SMD:C_0402_1005Metric_Pad0.74x0.62mm_HandSolder',
+        'Capacitor_SMD:C_0603_1608Metric_Pad1.08x0.95mm_HandSolder',
+        'Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder',
+        'Capacitor_SMD:C_1206_3216Metric_Pad1.33x1.80mm_HandSolder',
+        # Aluminum electrolytic SMD
+        'Capacitor_SMD:CP_Elec_4x5.4',
+        'Capacitor_SMD:CP_Elec_5x5.4',
+        'Capacitor_SMD:CP_Elec_5x5.8',
+        'Capacitor_SMD:CP_Elec_6.3x5.4',
+        'Capacitor_SMD:CP_Elec_6.3x5.8',
+        'Capacitor_SMD:CP_Elec_6.3x7.7',
+        'Capacitor_SMD:CP_Elec_8x6.7',
+        'Capacitor_SMD:CP_Elec_8x10.5',
+        'Capacitor_SMD:CP_Elec_10x10.5',
+        'Capacitor_SMD:CP_Elec_10x12.5',
+        # Tantalum SMD (separate library)
+        'Capacitor_Tantalum_SMD:CP_EIA-3216-18_Kemet-A',
+        'Capacitor_Tantalum_SMD:CP_EIA-3528-12_Kemet-B',
+        'Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-T',
+        'Capacitor_Tantalum_SMD:CP_EIA-6032-15_Kemet-C',
+        'Capacitor_Tantalum_SMD:CP_EIA-6032-28_Kemet-D',
+        'Capacitor_Tantalum_SMD:CP_EIA-7343-31_Kemet-D',
+        'Capacitor_Tantalum_SMD:CP_EIA-7343-43_Kemet-E',
+    ],
+    'L': [
+        # Inductor chip footprints
+        'Inductor_SMD:L_01005_0402Metric',
+        'Inductor_SMD:L_0201_0603Metric',
+        'Inductor_SMD:L_0402_1005Metric',
+        'Inductor_SMD:L_0603_1608Metric',
+        'Inductor_SMD:L_0805_2012Metric',
+        'Inductor_SMD:L_1008_2520Metric',
+        'Inductor_SMD:L_1206_3216Metric',
+        'Inductor_SMD:L_1210_3225Metric',
+        'Inductor_SMD:L_1812_4532Metric',
+        'Inductor_SMD:L_2010_5025Metric',
+        'Inductor_SMD:L_2512_6332Metric',
+        # Common shielded power inductor families (Coilcraft XAL series
+        # is widely used). Format: L_Coilcraft_XAL<size>xx_<dim>.
+        # Sizes documented in the KiCad library; pick the matching xx if
+        # not auto-completed.
+    ],
+}
+
+
+def _passives_known_packages(part_type: str, lib: dict) -> List[str]:
+    """Return the dropdown list for the package field: standard KiCad SMD
+    packages for the part type, plus any extras already used in the library
+    (sorted alphabetically after the standard list)."""
+    common = COMMON_PASSIVE_PACKAGES.get(part_type, [])
+    bucket = PASSIVE_LIB_KEY.get(part_type, '')
+    in_lib = set()
+    for entry in lib.get(bucket, []):
+        pkg = (entry.get('package') or '').strip()
+        if pkg:
+            in_lib.add(pkg)
+    common_set = set(common)
+    extras = sorted(in_lib - common_set)
+    return common + extras
+
+
+# ───── Unit normalization ─────────────────────────────────────────────────
+
+# Old-style EE notation: "4k7" = 4.7k, "2R2" = 2.2 ohm, "1R0" = 1.0 ohm
+_PASS_OLDSTYLE_RE = re.compile(
+    r'^\s*(?P<int>\d+)(?P<mult>[RrkKMmuUμµnNpP])(?P<frac>\d+)\s*(?P<unit>[a-zA-ZΩ]*)\s*$'
+)
+# Standard form: optional sign, number, optional multiplier, optional unit
+_PASS_STD_RE = re.compile(
+    r'^\s*(?P<sign>[-+]?)'
+    r'(?P<num>\d+(?:\.\d+)?|\.\d+)'
+    r'(?P<mult>[pPnNuUμµmkKMgGtT])?'
+    r'(?P<unit>[a-zA-ZΩ]*)\s*$'
+)
+
+def _passive_canon_mult(mult: str) -> str:
+    """Canonicalize a multiplier prefix. m/M case is preserved (milli vs mega)."""
+    if not mult: return ''
+    if mult in ('u', 'U', 'μ', 'µ'): return 'u'
+    if mult in ('k', 'K'): return 'k'
+    if mult == 'm': return 'm'   # milli — stays lowercase
+    if mult == 'M': return 'M'   # mega  — stays uppercase
+    if mult in ('p', 'P'): return 'p'
+    if mult in ('n', 'N'): return 'n'
+    if mult in ('g', 'G'): return 'G'
+    if mult in ('t', 'T'): return 'T'
+    return mult
+
+def _passive_canon_unit(rest: str) -> str:
+    """Canonicalize a unit suffix. F/H/Ω uppercased; 'ohm/ohms' → Ω."""
+    if not rest: return ''
+    upper = rest.upper()
+    if upper in ('OHM', 'OHMS'): return 'Ω'
+    if upper in ('F', 'H', 'Ω'): return upper
+    return rest
+
+def normalize_passive_value(raw: str) -> str:
+    """Return canonical form of a passive value:
+      - 1uF == 1UF == 1uf == 1µF
+      - 10k == 10K
+      - mΩ != MΩ (case preserved for milli vs mega)
+      - 4k7 → 4.7k, 2R2 → 2.2
+      - 100nF stays 100nF
+    Pass-through for non-numeric values (e.g. "DNP", a part-number value)."""
+    if not raw: return raw
+    s = raw.strip()
+    m = _PASS_OLDSTYLE_RE.match(s)
+    if m:
+        intp, mult, frac = m.group('int'), m.group('mult'), m.group('frac')
+        unit = m.group('unit') or ''
+        if mult in ('R', 'r'):
+            return f"{intp}.{frac}{_passive_canon_unit(unit)}"
+        return f"{intp}.{frac}{_passive_canon_mult(mult)}{_passive_canon_unit(unit)}"
+    m = _PASS_STD_RE.match(s)
+    if not m:
+        return s
+    return (f"{m.group('sign') or ''}{m.group('num')}"
+            f"{_passive_canon_mult(m.group('mult') or '')}"
+            f"{_passive_canon_unit(m.group('unit') or '')}")
+
+
+# ───── Footprint helpers ─────────────────────────────────────────────────
+
+_PASS_FP_SIZE_RE = re.compile(r'_(\d{4})_')
+
+def footprint_short(full_fp: str) -> str:
+    """Extract '0603' style short package size from a full KiCad footprint id.
+    Falls back to the lib-stripped name if no 4-digit size found."""
+    if not full_fp: return ''
+    m = _PASS_FP_SIZE_RE.search(full_fp)
+    if m: return m.group(1)
+    if ':' in full_fp:
+        return full_fp.split(':', 1)[1]
+    return full_fp
+
+
+def _passive_type_from_ref(ref: str) -> Optional[str]:
+    """Return 'R', 'C', or 'L' for properly-annotated passives, else None."""
+    if not ref: return None
+    m = re.match(r'^([RCL])(\d+)$', ref)
+    return m.group(1) if m else None
+
+
+# ───── Symbol-block property accessors ────────────────────────────────────
+
+def _get_property_from_block(block: str, name: str) -> Optional[str]:
+    """Extract a named property's value from a symbol block. None if absent."""
+    pattern = f'(property "{name}" "'
+    i = block.find(pattern)
+    if i == -1:
+        return None
+    val_start = i + len(pattern)
+    val_end = block.find('"', val_start)
+    if val_end == -1:
+        return None
+    return block[val_start:val_end]
+
+
+def _set_property_in_block(block: str, name: str, value: str) -> str:
+    """Set a property by name in a symbol block. Updates the value in-place if
+    the property already exists; otherwise inserts a new (property ...) block
+    after the last existing property, preserving the surrounding indentation
+    and line-ending style."""
+    esc_value = value.replace('\\', '\\\\').replace('"', '\\"')
+
+    pattern = f'(property "{name}" "'
+    i = block.find(pattern)
+    if i != -1:
+        # Update existing — replace just the text between the value's quotes.
+        val_start = i + len(pattern)
+        val_end = block.find('"', val_start)
+        if val_end == -1:
+            return block
+        return block[:val_start] + esc_value + block[val_end:]
+
+    # Insert new property after the last existing one.
+    last_prop_start = block.rfind('(property "')
+    if last_prop_start == -1:
+        return block  # malformed block — bail out without modifying
+    last_prop_end = _find_matching_paren(block, last_prop_start)
+    if last_prop_end == -1:
+        return block
+
+    # Detect indent (tabs/spaces) on the line of the last property.
+    line_start = block.rfind('\n', 0, last_prop_start) + 1
+    indent = block[line_start:last_prop_start]
+    eol = '\r\n' if '\r\n' in block else '\n'
+
+    new_prop = (
+        f'{eol}{indent}(property "{name}" "{esc_value}"'
+        f'{eol}{indent}\t(at 0 0 0)'
+        f'{eol}{indent}\t(effects'
+        f'{eol}{indent}\t\t(font'
+        f'{eol}{indent}\t\t\t(size 1.27 1.27)'
+        f'{eol}{indent}\t\t)'
+        f'{eol}{indent}\t\t(hide yes)'
+        f'{eol}{indent}\t)'
+        f'{eol}{indent})'
+    )
+    insert_point = last_prop_end + 1
+    return block[:insert_point] + new_prop + block[insert_point:]
+
+
+# ───── Library load/save ──────────────────────────────────────────────────
+
+def passives_library_load() -> dict:
+    """Load the global passives library from disk. Returns an empty skeleton
+    if the file doesn't exist or is invalid."""
+    skeleton = {'version': 1, 'resistors': [], 'capacitors': [], 'inductors': []}
+    if not PASSIVES_LIB_FILE.exists():
+        return skeleton
+    try:
+        data = json.loads(PASSIVES_LIB_FILE.read_text(encoding='utf-8'))
+        # Ensure all keys exist
+        for k in ('resistors', 'capacitors', 'inductors'):
+            data.setdefault(k, [])
+        data.setdefault('version', 1)
+        return data
+    except (json.JSONDecodeError, OSError):
+        return skeleton
+
+
+def passives_library_save(lib: dict) -> None:
+    """Save the library to disk, creating the dir if needed."""
+    PASSIVES_LIB_DIR.mkdir(parents=True, exist_ok=True)
+    PASSIVES_LIB_FILE.write_text(json.dumps(lib, indent=2, ensure_ascii=False),
+                                 encoding='utf-8')
+
+
+def passives_library_match(part_type: str, value_norm: str, package_short: str,
+                            lib: dict) -> List[dict]:
+    """Find library entries that match the given normalized value and short
+    package code. Both must be non-empty for a match."""
+    if not value_norm or not package_short:
+        return []
+    bucket_key = PASSIVE_LIB_KEY.get(part_type)
+    if not bucket_key:
+        return []
+    matches = []
+    for entry in lib.get(bucket_key, []):
+        e_val = normalize_passive_value(entry.get('value', ''))
+        e_pkg = footprint_short(entry.get('package', ''))
+        if e_val == value_norm and e_pkg == package_short:
+            matches.append(entry)
+    return matches
+
+
+def passives_library_next_id(lib: dict, part_type: str) -> str:
+    """Generate a new unique id for a library entry."""
+    bucket_key = PASSIVE_LIB_KEY[part_type]
+    nums = []
+    prefix = part_type.lower() + '_'
+    for entry in lib.get(bucket_key, []):
+        eid = entry.get('id', '')
+        if eid.startswith(prefix):
+            try:
+                nums.append(int(eid[len(prefix):]))
+            except ValueError:
+                pass
+    nxt = max(nums, default=0) + 1
+    return f"{prefix}{nxt:04d}"
+
+
+# ───── Schematic walker ──────────────────────────────────────────────────
+
+def parse_passives_from_project(entry_file: Path) -> List[dict]:
+    """Walk a project (or single sch file) and return all R/C/L instances.
+    Each dict contains: ref, type ('R'/'C'/'L'), value, value_norm,
+    footprint_full, footprint_short, mpn, lcsc, all_props (dict of all
+    custom property values currently on the symbol), block, file (Path)."""
+    sch_data = parse_kicad_project(entry_file)
+    passives = []
+    for file_path, file_data in sch_data.items():
+        for comp in file_data['components']:
+            pt = _passive_type_from_ref(comp['ref'])
+            if pt is None:
+                continue
+            block = comp['block']
+            all_props = {}
+            # Capture every property currently set on the symbol so the Edit
+            # dialog has full context. Cheap regex, only on a single block.
+            for m in re.finditer(r'\(property "([^"]+)" "([^"]*)"', block):
+                all_props[m.group(1)] = m.group(2)
+            passives.append({
+                'ref':             comp['ref'],
+                'type':            pt,
+                'value':           comp['value'],
+                'value_norm':      normalize_passive_value(comp['value']),
+                'footprint_full':  comp['footprint'],
+                'footprint_short': footprint_short(comp['footprint']),
+                'mpn':             all_props.get('MPN', ''),
+                'lcsc':            all_props.get('LCSC', ''),
+                'all_props':       all_props,
+                'block':           block,
+                'file':            file_path,
+            })
+    return passives
+
+
+# ───── Apply updates to schematics ───────────────────────────────────────
+
+def apply_passives_updates(updates: List[dict]) -> dict:
+    """Apply a list of updates to schematic files.
+    
+    Each update dict requires:
+      - 'passive': the passive dict (must have 'block' and 'file')
+      - 'fields':  dict of {kicad_property_name: new_value}
+
+    Updates are grouped by file. Each file is read once, all blocks for
+    that file are updated, a .bak is taken, then the new text is written.
+
+    Returns: {'updated': N_components, 'files_modified': N_files,
+              'errors': [list of error strings]}.
+    """
+    by_file: Dict[str, List[dict]] = {}
+    for u in updates:
+        f = u['passive']['file']
+        by_file.setdefault(f, []).append(u)
+
+    errors = []
+    updated_count = 0
+
+    for file_path, ups in by_file.items():
+        sch_path = Path(file_path)
+        if not sch_path.exists():
+            errors.append(f"File missing: {sch_path}")
+            continue
+        text = sch_path.read_text(encoding='utf-8')
+
+        # Sanity-check: every block we're about to replace must still exist
+        # in the file exactly once. If not, the file changed under us.
+        for u in ups:
+            blk = u['passive']['block']
+            occ = text.count(blk)
+            if occ != 1:
+                errors.append(f"{u['passive']['ref']}: block not found "
+                              f"({occ} occurrences) — file may have changed "
+                              f"externally")
+
+        if errors:
+            continue
+
+        # Apply each update
+        for u in ups:
+            orig_block = u['passive']['block']
+            new_block = orig_block
+            for prop_name, val in u['fields'].items():
+                if val is None:
+                    continue
+                new_block = _set_property_in_block(new_block, prop_name, val)
+            if new_block != orig_block:
+                text = text.replace(orig_block, new_block, 1)
+                updated_count += 1
+
+        # Backup then write
+        backup_path = sch_path.with_suffix('.kicad_sch.bak')
+        try:
+            shutil.copy2(sch_path, backup_path)
+            sch_path.write_text(text, encoding='utf-8')
+        except OSError as e:
+            errors.append(f"Write failed for {sch_path}: {e}")
+
+    return {
+        'updated':        updated_count,
+        'files_modified': len(by_file) - sum(1 for f in by_file
+                                             if not (Path(f).exists())),
+        'errors':         errors,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PASSIVES TAB — UI methods (bound to App class below)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _create_passives_tab(self, parent):
+    """Create the Passives tab: schematic scanner + library-driven assignment."""
+    parent.grid_columnconfigure(0, weight=1)
+    parent.grid_rowconfigure(2, weight=1)  # table row gets stretch
+
+    # State
+    self.passives_data = []          # list of passive dicts
+    self.passives_library = passives_library_load()
+    self.passives_checked = set()    # set of refs currently checked
+    self.passives_filter_type = tk.StringVar(value="All")
+    self.passives_filter_status = tk.StringVar(value="All")
+    self.passives_filter_text = tk.StringVar()
+    self.passives_sch_file = tk.StringVar()
+    # Manual-entry vars
+    self.passives_manual_mpn = tk.StringVar()
+    self.passives_manual_lcsc = tk.StringVar()
+
+    # ── Section 1: schematic file picker + scan ──
+    file_frame = ttk.Labelframe(parent, text="1. Schematic", padding=12)
+    file_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+    file_frame.grid_columnconfigure(1, weight=1)
+
+    ttk.Label(file_frame, text="Schematic / Project:").grid(
+        row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(file_frame, textvariable=self.passives_sch_file,
+              state="readonly").grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+    ttk.Button(file_frame, text="📁 Browse",
+               command=self._passives_browse_schematic).grid(
+        row=0, column=2, padx=4, pady=4)
+    ttk.Button(file_frame, text="🔄 Scan", command=self._passives_scan,
+               style="Accent.TButton").grid(row=0, column=3, padx=4, pady=4)
+
+    self.passives_status = tk.StringVar(
+        value="Pick a .kicad_sch or .kicad_pro file and click Scan.")
+    ttk.Label(file_frame, textvariable=self.passives_status,
+              foreground=COLORS['text_muted']).grid(
+        row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    # ── Section 2: filters ──
+    filter_frame = ttk.Frame(parent)
+    filter_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=4)
+
+    ttk.Label(filter_frame, text="Type:").pack(side="left", padx=(0, 4))
+    ttk.Combobox(filter_frame, textvariable=self.passives_filter_type,
+                 values=["All", "Resistors", "Capacitors", "Inductors"],
+                 state="readonly", width=12).pack(side="left", padx=4)
+    self.passives_filter_type.trace_add(
+        "write", lambda *a: self._passives_refresh_table())
+
+    ttk.Label(filter_frame, text="Status:").pack(side="left", padx=(12, 4))
+    ttk.Combobox(filter_frame, textvariable=self.passives_filter_status,
+                 values=["All", "Missing MPN", "Missing LCSC",
+                         "Missing MPN or LCSC", "Has MPN and LCSC",
+                         "Missing Footprint"],
+                 state="readonly", width=20).pack(side="left", padx=4)
+    self.passives_filter_status.trace_add(
+        "write", lambda *a: self._passives_refresh_table())
+
+    ttk.Label(filter_frame, text="Filter:").pack(side="left", padx=(12, 4))
+    filter_entry = ttk.Entry(filter_frame, textvariable=self.passives_filter_text,
+                             width=24)
+    filter_entry.pack(side="left", padx=4)
+    self.passives_filter_text.trace_add(
+        "write", lambda *a: self._passives_refresh_table())
+
+    self.passives_count_var = tk.StringVar()
+    ttk.Label(filter_frame, textvariable=self.passives_count_var,
+              foreground=COLORS['text_muted']).pack(side="right", padx=8)
+
+    # ── Section 3: components table + action panel ──
+    body = ttk.Frame(parent)
+    body.grid(row=2, column=0, sticky="nsew", padx=16, pady=8)
+    body.grid_columnconfigure(0, weight=3)
+    body.grid_columnconfigure(1, weight=2)
+    body.grid_rowconfigure(0, weight=1)
+
+    # ── Left pane: Treeview ──
+    tree_frame = ttk.Labelframe(body, text="2. Passives", padding=8)
+    tree_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    tree_frame.grid_columnconfigure(0, weight=1)
+    tree_frame.grid_rowconfigure(0, weight=1)
+
+    cols = ("chk", "ref", "type", "value", "package", "mpn", "lcsc")
+    self.passives_tree = ttk.Treeview(tree_frame, columns=cols,
+                                       show="headings", height=18,
+                                       selectmode="extended")
+    self.passives_tree.grid(row=0, column=0, sticky="nsew")
+
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                        command=self.passives_tree.yview)
+    vsb.grid(row=0, column=1, sticky="ns")
+    self.passives_tree.configure(yscrollcommand=vsb.set)
+
+    self.passives_tree.heading("chk",     text="✓")
+    self.passives_tree.heading("ref",     text="Ref")
+    self.passives_tree.heading("type",    text="Type")
+    self.passives_tree.heading("value",   text="Value")
+    self.passives_tree.heading("package", text="Package")
+    self.passives_tree.heading("mpn",     text="MPN")
+    self.passives_tree.heading("lcsc",    text="LCSC")
+
+    self.passives_tree.column("chk",     width=36,  anchor="center", stretch=False)
+    self.passives_tree.column("ref",     width=70,  anchor="w",      stretch=False)
+    self.passives_tree.column("type",    width=70,  anchor="w",      stretch=False)
+    self.passives_tree.column("value",   width=110, anchor="w")
+    self.passives_tree.column("package", width=110, anchor="w")
+    self.passives_tree.column("mpn",     width=170, anchor="w")
+    self.passives_tree.column("lcsc",    width=90,  anchor="w")
+
+    # Tag colors: missing fields warning, has-value highlight
+    self.passives_tree.tag_configure(
+        "missing", background="#3a2a16", foreground=COLORS['warning'])
+    self.passives_tree.tag_configure(
+        "has_values", foreground=COLORS['success'])
+    self.passives_tree.tag_configure(
+        "checked", background="#0d2e4a")
+
+    self.passives_tree.bind("<Button-1>", self._passives_on_click)
+    self.passives_tree.bind("<Double-Button-1>", self._passives_on_double_click)
+
+    # Below the tree: select-all / select-group buttons
+    select_bar = ttk.Frame(tree_frame)
+    select_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Button(select_bar, text="Check Visible",
+               command=self._passives_check_visible).pack(side="left", padx=2)
+    ttk.Button(select_bar, text="Uncheck All",
+               command=self._passives_uncheck_all).pack(side="left", padx=2)
+    ttk.Button(select_bar, text="Edit Row…",
+               command=self._passives_edit_row_cmd).pack(side="left", padx=12)
+
+    # ── Right pane: action panel ──
+    action = ttk.Frame(body)
+    action.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+    action.grid_columnconfigure(0, weight=1)
+
+    # 3a: selection summary + warning
+    sel_frame = ttk.Labelframe(action, text="3. Selection", padding=10)
+    sel_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    sel_frame.grid_columnconfigure(0, weight=1)
+    self.passives_selection_var = tk.StringVar(value="No rows checked.")
+    ttk.Label(sel_frame, textvariable=self.passives_selection_var,
+              wraplength=320, justify="left").grid(row=0, column=0, sticky="w")
+    self.passives_warning_var = tk.StringVar()
+    self.passives_warning_lbl = ttk.Label(sel_frame, textvariable=self.passives_warning_var,
+                                            foreground=COLORS['warning'],
+                                            wraplength=320, justify="left")
+    self.passives_warning_lbl.grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+    # 3b: Library dropdown
+    lib_frame = ttk.Labelframe(action, text="4. Apply from Library", padding=10)
+    lib_frame.grid(row=1, column=0, sticky="ew", pady=6)
+    lib_frame.grid_columnconfigure(0, weight=1)
+
+    self.passives_lib_combo_var = tk.StringVar()
+    self.passives_lib_combo = ttk.Combobox(lib_frame,
+                                            textvariable=self.passives_lib_combo_var,
+                                            state="readonly")
+    self.passives_lib_combo.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+    btn_row = ttk.Frame(lib_frame)
+    btn_row.grid(row=1, column=0, sticky="ew")
+    ttk.Button(btn_row, text="Apply from Library",
+               command=self._passives_apply_from_library,
+               style="Accent.TButton").pack(side="left", padx=2)
+    ttk.Button(btn_row, text="📚 Manage Library…",
+               command=self._passives_open_library_manager).pack(side="left", padx=2)
+
+    # 3c: Manual entry
+    man_frame = ttk.Labelframe(action, text="5. Apply Manually", padding=10)
+    man_frame.grid(row=2, column=0, sticky="ew", pady=6)
+    man_frame.grid_columnconfigure(1, weight=1)
+
+    ttk.Label(man_frame, text="MPN:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+    ttk.Entry(man_frame, textvariable=self.passives_manual_mpn).grid(
+        row=0, column=1, sticky="ew", pady=2)
+    ttk.Label(man_frame, text="LCSC:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=2)
+    ttk.Entry(man_frame, textvariable=self.passives_manual_lcsc).grid(
+        row=1, column=1, sticky="ew", pady=2)
+
+    btn_row2 = ttk.Frame(man_frame)
+    btn_row2.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Button(btn_row2, text="Apply Manual",
+               command=self._passives_apply_manual,
+               style="Accent.TButton").pack(side="left", padx=2)
+
+    # 3d: Save to library
+    save_frame = ttk.Labelframe(action, text="6. Save to Library", padding=10)
+    save_frame.grid(row=3, column=0, sticky="ew", pady=6)
+    save_frame.grid_columnconfigure(0, weight=1)
+
+    ttk.Button(save_frame, text="💾 Save Selected to Library",
+               command=self._passives_save_to_library).pack(
+        fill="x", pady=2)
+    ttk.Button(save_frame, text="📚 Save All Complete to Library…",
+               command=self._passives_save_all_complete).pack(
+        fill="x", pady=2)
+    ttk.Label(save_frame,
+              text="Bulk: walks every unique part with Value+Footprint+MPN "
+                   "through a pre-filled form. Required = Value, Package, MPN.",
+              foreground=COLORS['text_muted'],
+              font=("Segoe UI", 8),
+              wraplength=320, justify="left").pack(anchor="w", pady=(4, 0))
+
+
+# ───── Tab actions ────────────────────────────────────────────────────────
+
+def _passives_browse_schematic(self):
+    fname = filedialog.askopenfilename(
+        title="Select Schematic or Project",
+        filetypes=[("KiCad Schematic", "*.kicad_sch"),
+                   ("KiCad Project", "*.kicad_pro"),
+                   ("All Files", "*.*")])
+    if fname:
+        self.passives_sch_file.set(fname)
+
+
+def _passives_scan(self):
+    """Walk the schematic and populate the table."""
+    fname = self.passives_sch_file.get()
+    if not fname:
+        messagebox.showwarning("No Schematic", "Please select a schematic file first.")
+        return
+    p = Path(fname)
+    if not p.exists():
+        messagebox.showerror("Not Found", f"File does not exist:\n{p}")
+        return
+    try:
+        self.passives_data = parse_passives_from_project(p)
+    except Exception as e:
+        messagebox.showerror("Parse Error", f"Failed to parse schematic:\n{e}")
+        return
+
+    # Sort: value (natural numeric), then footprint, then ref
+    self.passives_data.sort(key=lambda x: (
+        x['type'],
+        _passive_sort_key(x['value_norm']),
+        x['footprint_short'],
+        _ref_sort_key(x['ref']),
+    ))
+
+    self.passives_checked.clear()
+    n = len(self.passives_data)
+    n_r = sum(1 for p in self.passives_data if p['type'] == 'R')
+    n_c = sum(1 for p in self.passives_data if p['type'] == 'C')
+    n_l = sum(1 for p in self.passives_data if p['type'] == 'L')
+    self.passives_status.set(
+        f"Found {n} passives  ·  {n_r} R, {n_c} C, {n_l} L  ·  {p.name}")
+    self._passives_refresh_table()
+
+
+def _passive_sort_key(value_norm: str):
+    """Natural sort key: 1k < 10k < 100k < 1M. Falls back to text for non-numeric."""
+    multipliers = {'p': 1e-12, 'n': 1e-9, 'u': 1e-6, 'm': 1e-3,
+                   '': 1, 'k': 1e3, 'M': 1e6, 'G': 1e9, 'T': 1e12}
+    m = re.match(r'^[-+]?(\d+(?:\.\d+)?|\.\d+)([pnumkMGT]?)', value_norm or '')
+    if m:
+        try:
+            num = float(m.group(1)) * multipliers.get(m.group(2), 1)
+            return (0, num)
+        except ValueError:
+            pass
+    return (1, value_norm or '')
+
+
+def _ref_sort_key(ref: str):
+    """Sort R10 < R100 < R20 the human way."""
+    m = re.match(r'^([A-Za-z]+)(\d+)$', ref or '')
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (ref or '', 0)
+
+
+def _passives_refresh_table(self):
+    """Repopulate the tree with current data, applying type/status/text filters."""
+    tree = self.passives_tree
+    for iid in tree.get_children():
+        tree.delete(iid)
+
+    type_filter = self.passives_filter_type.get()
+    status_filter = self.passives_filter_status.get()
+    text_filter = (self.passives_filter_text.get() or '').strip().lower()
+    type_map = {'Resistors': 'R', 'Capacitors': 'C', 'Inductors': 'L'}
+    type_letter = type_map.get(type_filter)
+
+    visible = 0
+    for p in self.passives_data:
+        if type_letter and p['type'] != type_letter:
+            continue
+        # Status filter
+        if status_filter == "Missing MPN" and p['mpn']:
+            continue
+        elif status_filter == "Missing LCSC" and p['lcsc']:
+            continue
+        elif status_filter == "Missing MPN or LCSC" and p['mpn'] and p['lcsc']:
+            continue
+        elif status_filter == "Has MPN and LCSC" and (not p['mpn'] or not p['lcsc']):
+            continue
+        elif status_filter == "Missing Footprint" and p['footprint_full']:
+            continue
+        if text_filter:
+            hay = f"{p['ref']} {p['value']} {p['footprint_short']} " \
+                  f"{p['mpn']} {p['lcsc']}".lower()
+            if text_filter not in hay:
+                continue
+
+        # Determine row tags
+        tags = []
+        if not p['value'] or not p['footprint_full']:
+            tags.append("missing")
+        elif p['mpn'] or p['lcsc']:
+            tags.append("has_values")
+        if p['ref'] in self.passives_checked:
+            tags.append("checked")
+
+        chk = "☑" if p['ref'] in self.passives_checked else "☐"
+        tree.insert("", "end", iid=p['ref'],
+                    values=(chk, p['ref'], PASSIVE_TYPE_LABEL[p['type']],
+                            p['value'], p['footprint_short'] or '— missing —',
+                            p['mpn'], p['lcsc']),
+                    tags=tags)
+        visible += 1
+
+    self.passives_count_var.set(
+        f"{visible} shown · {len(self.passives_checked)} checked")
+    self._passives_update_selection_panel()
+
+
+def _passives_on_click(self, event):
+    """Toggle row checkbox if user clicked the ✓ column."""
+    region = self.passives_tree.identify("region", event.x, event.y)
+    column = self.passives_tree.identify_column(event.x)
+    iid    = self.passives_tree.identify_row(event.y)
+    if region != "cell" or column != "#1" or not iid:
+        return  # let normal selection happen
+    self._passives_toggle_check(iid)
+    return "break"
+
+
+def _passives_toggle_check(self, ref: str):
+    """Toggle the checked-state of a given ref, with heterogeneous-selection
+    block (can't mix different value/package)."""
+    if ref in self.passives_checked:
+        self.passives_checked.remove(ref)
+        self._passives_refresh_table()
+        return
+
+    # Adding: enforce same (type, value_norm, package_short) as already-checked
+    target = next((p for p in self.passives_data if p['ref'] == ref), None)
+    if target is None:
+        return
+
+    if self.passives_checked:
+        existing = next((p for p in self.passives_data
+                          if p['ref'] in self.passives_checked), None)
+        if existing is not None:
+            same = (existing['type'] == target['type']
+                    and existing['value_norm'] == target['value_norm']
+                    and existing['footprint_short'] == target['footprint_short'])
+            if not same:
+                messagebox.showwarning(
+                    "Selection Mismatch",
+                    f"Selection must share Value and Package.\n\n"
+                    f"Already checked:  {existing['type']} "
+                    f"{existing['value_norm']} / "
+                    f"{existing['footprint_short'] or '—'}\n"
+                    f"Tried to check:   {target['type']} "
+                    f"{target['value_norm']} / "
+                    f"{target['footprint_short'] or '—'}\n\n"
+                    f"Uncheck the others first if you want to switch groups.")
+                return
+
+    self.passives_checked.add(ref)
+    self._passives_refresh_table()
+
+
+def _passives_check_visible(self):
+    """Check every currently-visible row that is compatible with the current
+    selection group (or whichever group the first visible row defines)."""
+    tree = self.passives_tree
+    visible_refs = list(tree.get_children())
+    if not visible_refs:
+        return
+
+    # Determine the target group from currently checked, or the first visible.
+    if self.passives_checked:
+        anchor_ref = next(iter(self.passives_checked))
+    else:
+        anchor_ref = visible_refs[0]
+    anchor = next((p for p in self.passives_data
+                   if p['ref'] == anchor_ref), None)
+    if not anchor:
+        return
+
+    skipped = 0
+    for ref in visible_refs:
+        p = next((q for q in self.passives_data if q['ref'] == ref), None)
+        if not p:
+            continue
+        if (p['type'] == anchor['type']
+                and p['value_norm'] == anchor['value_norm']
+                and p['footprint_short'] == anchor['footprint_short']):
+            self.passives_checked.add(ref)
+        else:
+            skipped += 1
+
+    self._passives_refresh_table()
+    if skipped:
+        self.passives_status.set(
+            f"Checked compatible visible rows · skipped {skipped} "
+            f"with different value/package")
+
+
+def _passives_uncheck_all(self):
+    self.passives_checked.clear()
+    self._passives_refresh_table()
+
+
+def _passives_update_selection_panel(self):
+    """Update the right-pane selection summary + library dropdown."""
+    checked = [p for p in self.passives_data
+               if p['ref'] in self.passives_checked]
+    n = len(checked)
+
+    # Warning state for missing value/package on any checked row
+    self.passives_warning_var.set("")
+    if n == 0:
+        self.passives_selection_var.set("No rows checked.")
+        self.passives_lib_combo['values'] = []
+        self.passives_lib_combo.set('')
+        return
+
+    anchor = checked[0]
+    refs_str = ', '.join(p['ref'] for p in checked[:8])
+    if n > 8:
+        refs_str += f", … ({n} total)"
+    self.passives_selection_var.set(
+        f"{n} checked  ·  {PASSIVE_TYPE_LABEL[anchor['type']]} "
+        f"{anchor['value']}  /  {anchor['footprint_short'] or '— missing —'}\n"
+        f"{refs_str}")
+
+    missing_v = sum(1 for p in checked if not p['value'])
+    missing_f = sum(1 for p in checked if not p['footprint_full'])
+    warns = []
+    if missing_v:
+        warns.append(f"⚠ {missing_v} have no Value")
+    if missing_f:
+        warns.append(f"⚠ {missing_f} have no Footprint")
+    if warns:
+        warns.append("Apply will SET these fields.")
+    self.passives_warning_var.set("\n".join(warns))
+
+    # Populate library dropdown with matches
+    matches = passives_library_match(
+        anchor['type'], anchor['value_norm'],
+        anchor['footprint_short'], self.passives_library)
+    self._passives_lib_matches = matches  # cache for apply
+    if matches:
+        labels = [_passive_lib_label(e, anchor['type']) for e in matches]
+        self.passives_lib_combo['values'] = labels
+        self.passives_lib_combo.set(labels[0])
+    else:
+        self.passives_lib_combo['values'] = ["(no library matches)"]
+        self.passives_lib_combo.set("(no library matches)")
+
+
+def _passive_lib_label(entry: dict, part_type: str) -> str:
+    """One-line label for the library dropdown."""
+    val = entry.get('value', '?')
+    pkg = footprint_short(entry.get('package', '?'))
+    mpn = entry.get('mpn', '?')
+    lcsc = entry.get('lcsc', '?')
+    extras = []
+    if part_type == 'C':
+        if entry.get('voltage'):    extras.append(entry['voltage'])
+        if entry.get('dielectric'): extras.append(entry['dielectric'])
+        if entry.get('tolerance'):  extras.append(entry['tolerance'])
+    elif part_type == 'R':
+        if entry.get('tolerance'):  extras.append(entry['tolerance'])
+        if entry.get('power'):      extras.append(entry['power'])
+    elif part_type == 'L':
+        if entry.get('isat'):       extras.append(f"Isat {entry['isat']}")
+        if entry.get('dcr'):        extras.append(f"DCR {entry['dcr']}")
+    extras_s = ' '.join(extras) if extras else '—'
+    return f"{val} {pkg} · {extras_s}  →  {mpn} / {lcsc}"
+
+
+def _passives_apply_manual(self):
+    """Apply manually-typed MPN+LCSC to all checked rows."""
+    mpn  = self.passives_manual_mpn.get().strip()
+    lcsc = self.passives_manual_lcsc.get().strip()
+    if not mpn and not lcsc:
+        messagebox.showwarning("Nothing to Apply",
+            "Enter MPN and/or LCSC before clicking Apply Manual.")
+        return
+    fields = {}
+    if mpn:  fields['MPN']  = mpn
+    if lcsc: fields['LCSC'] = lcsc
+    self._passives_apply_fields_to_checked(fields)
+
+
+def _passives_apply_from_library(self):
+    """Apply the selected library entry's fields to all checked rows."""
+    if not getattr(self, '_passives_lib_matches', None):
+        messagebox.showwarning("No Library Match",
+            "No library entries match the current selection.\n\n"
+            "Use 'Save to Library' to add one, or apply manually.")
+        return
+    label = self.passives_lib_combo_var.get()
+    sel = next((e for i, e in enumerate(self._passives_lib_matches)
+                if _passive_lib_label(e, e.get('type', '')) == label
+                or label == _passive_lib_label(
+                    e, [p for p in self.passives_data
+                        if p['ref'] in self.passives_checked][0]['type'])),
+               None)
+    # Simpler: index by combo selection position
+    idx = self.passives_lib_combo.current()
+    if idx < 0 or idx >= len(self._passives_lib_matches):
+        return
+    entry = self._passives_lib_matches[idx]
+
+    # Determine which fields to write based on part type of selection
+    checked = [p for p in self.passives_data
+               if p['ref'] in self.passives_checked]
+    if not checked:
+        return
+    pt = checked[0]['type']
+    fields = {}
+    for lib_key, kicad_name in PASSIVE_FIELD_MAP[pt]:
+        v = entry.get(lib_key, '')
+        if v:
+            fields[kicad_name] = v
+    # Also stamp Value+Footprint if any checked row is missing them
+    if any(not p['value'] for p in checked) and entry.get('value'):
+        fields['Value'] = entry['value']
+    if any(not p['footprint_full'] for p in checked) and entry.get('package'):
+        fields['Footprint'] = entry['package']
+    if entry.get('datasheet'):
+        fields['Datasheet'] = entry['datasheet']
+
+    self._passives_apply_fields_to_checked(fields)
+
+
+def _passives_apply_fields_to_checked(self, fields: dict):
+    """Common apply path: confirm overwrites if any, then write to disk."""
+    checked = [p for p in self.passives_data
+               if p['ref'] in self.passives_checked]
+    if not checked:
+        messagebox.showwarning("No Selection",
+                               "Check at least one row before applying.")
+        return
+
+    # Detect existing values for any field we're about to overwrite
+    conflicts = []  # (ref, field_name, old_value, new_value)
+    for p in checked:
+        for fname, fval in fields.items():
+            existing = p['all_props'].get(fname, '')
+            if fname == 'Value':
+                existing = p['value']
+            elif fname == 'Footprint':
+                existing = p['footprint_full']
+            if existing and existing != fval:
+                conflicts.append((p['ref'], fname, existing, fval))
+
+    if conflicts:
+        if not self._passives_confirm_overwrite(conflicts):
+            return
+
+    # Build update list and apply
+    updates = [{'passive': p, 'fields': dict(fields)} for p in checked]
+    result = apply_passives_updates(updates)
+
+    if result['errors']:
+        messagebox.showerror("Apply Failed",
+            "Some updates could not be applied:\n\n"
+            + "\n".join(result['errors'][:10]))
+        return
+
+    n_updated = result['updated']
+    messagebox.showinfo("Applied",
+        f"Updated {n_updated} component{'s' if n_updated != 1 else ''}.\n\n"
+        f"Backup saved as <file>.kicad_sch.bak\n\n"
+        f"Re-scanning to refresh table…")
+
+    # Re-scan to pick up the new state
+    self._passives_scan()
+
+
+def _passives_confirm_overwrite(self, conflicts):
+    """Show a single dialog listing all conflicts. Return True if user confirms."""
+    dlg = tk.Toplevel(self)
+    dlg.title("Existing Values — Confirm Overwrite")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    dlg.geometry("700x450")
+
+    ttk.Label(dlg, text=f"⚠ {len(conflicts)} field(s) already have values "
+                        f"that will be overwritten:",
+              foreground=COLORS['warning']).pack(anchor="w", padx=12, pady=(12, 6))
+
+    cols = ("ref", "field", "old", "new")
+    tv = ttk.Treeview(dlg, columns=cols, show="headings", height=14)
+    tv.heading("ref",   text="Ref");      tv.column("ref",   width=80)
+    tv.heading("field", text="Field");    tv.column("field", width=120)
+    tv.heading("old",   text="Current");  tv.column("old",   width=220)
+    tv.heading("new",   text="New");      tv.column("new",   width=220)
+    for c in conflicts:
+        tv.insert("", "end", values=c)
+    tv.pack(fill="both", expand=True, padx=12, pady=4)
+
+    result = {'confirmed': False}
+    def do_confirm():
+        result['confirmed'] = True
+        dlg.destroy()
+    def do_cancel():
+        dlg.destroy()
+
+    btns = ttk.Frame(dlg); btns.pack(fill="x", padx=12, pady=12)
+    ttk.Button(btns, text="Cancel", command=do_cancel).pack(side="right", padx=4)
+    ttk.Button(btns, text="Overwrite All", command=do_confirm,
+               style="Accent.TButton").pack(side="right", padx=4)
+
+    self.wait_window(dlg)
+    return result['confirmed']
+
+
+def _passives_save_to_library(self):
+    """Pop a form to save the currently-selected MPN/LCSC + extra metadata
+    to the library, so it can be re-applied to future projects."""
+    checked = [p for p in self.passives_data
+               if p['ref'] in self.passives_checked]
+    if not checked:
+        messagebox.showwarning("No Selection",
+            "Check one or more rows whose MPN/LCSC you want to save.")
+        return
+    anchor = checked[0]
+
+    # Pre-fill from the currently typed manual MPN/LCSC, falling back to the
+    # MPN/LCSC already on the symbol.
+    init_mpn  = self.passives_manual_mpn.get().strip()  or anchor['mpn']
+    init_lcsc = self.passives_manual_lcsc.get().strip() or anchor['lcsc']
+
+    self._passives_show_library_entry_dialog(
+        part_type=anchor['type'],
+        initial={
+            'value':    anchor['value_norm'],
+            'package':  anchor['footprint_full'],
+            'mpn':      init_mpn,
+            'lcsc':     init_lcsc,
+        },
+        on_save=self._passives_persist_new_entry,
+        title="Save to Library",
+    )
+
+
+def _passives_persist_new_entry(self, part_type: str, entry: dict):
+    """Add a new entry to the library and save."""
+    entry['id'] = passives_library_next_id(self.passives_library, part_type)
+    bucket = PASSIVE_LIB_KEY[part_type]
+    self.passives_library.setdefault(bucket, []).append(entry)
+    passives_library_save(self.passives_library)
+    self._passives_update_selection_panel()
+    messagebox.showinfo("Saved",
+        f"Saved to library: {entry.get('value','?')} "
+        f"{footprint_short(entry.get('package','?'))} "
+        f"→  {entry.get('mpn','?')} / {entry.get('lcsc','?')}")
+
+
+def _passives_show_library_entry_dialog(self, part_type: str, initial: dict,
+                                         on_save, title: str,
+                                         existing_id: Optional[str] = None):
+    """Form for adding or editing a library entry. Shared by 'Save to Library'
+    and the Library Manager."""
+    dlg = tk.Toplevel(self)
+    dlg.title(title)
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    dlg.geometry("520x600")
+
+    ttk.Label(dlg, text=f"{PASSIVE_TYPE_LABEL[part_type]} library entry",
+              font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
+
+    form = ttk.Frame(dlg); form.pack(fill="both", expand=True, padx=12, pady=4)
+    form.grid_columnconfigure(1, weight=1)
+
+    # Fields per part type. Each entry is (key, label, hint).
+    fields = PASSIVE_FORM_FIELDS[part_type]
+    vars_ = {}
+    pkg_values = _passives_known_packages(part_type, self.passives_library)
+    for r, (key, label, hint) in enumerate(fields):
+        ttk.Label(form, text=label + ":").grid(row=r, column=0, sticky="e",
+                                                 padx=(0, 6), pady=3)
+        v = tk.StringVar(value=initial.get(key, ''))
+        vars_[key] = v
+        if key == 'package':
+            ttk.Combobox(form, textvariable=v, values=pkg_values).grid(
+                row=r, column=1, sticky="ew", pady=3)
+        else:
+            ttk.Entry(form, textvariable=v).grid(row=r, column=1, sticky="ew", pady=3)
+        if hint:
+            ttk.Label(form, text=hint, foreground=COLORS['text_muted'],
+                      font=("Segoe UI", 8)).grid(row=r, column=2,
+                                                  sticky="w", padx=(6, 0))
+
+    btns = ttk.Frame(dlg); btns.pack(fill="x", padx=12, pady=10)
+
+    def do_save():
+        entry = {k: v.get().strip() for k, v in vars_.items()}
+        if not entry.get('value') or not entry.get('package'):
+            messagebox.showwarning("Missing Fields",
+                "Value and Package are required.", parent=dlg)
+            return
+        if not entry.get('mpn') and not entry.get('lcsc'):
+            messagebox.showwarning("Missing Fields",
+                "At least one of MPN or LCSC must be provided.", parent=dlg)
+            return
+        if existing_id:
+            entry['id'] = existing_id
+        dlg.destroy()
+        on_save(part_type, entry)
+
+    ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+    ttk.Button(btns, text="Save",   command=do_save,
+               style="Accent.TButton").pack(side="right", padx=4)
+
+
+# ───── Edit row (forcible field change) ──────────────────────────────────
+
+def _passives_on_double_click(self, event):
+    """Double-click a row → open the row-edit dialog."""
+    iid = self.passives_tree.identify_row(event.y)
+    if iid:
+        self._passives_edit_row(iid)
+
+
+def _passives_edit_row_cmd(self):
+    """Edit Row… button — operate on the focused row (single-click selection)."""
+    sel = self.passives_tree.focus()
+    if not sel:
+        messagebox.showinfo("No Row",
+            "Click a row to focus it, then click Edit Row.")
+        return
+    self._passives_edit_row(sel)
+
+
+def _passives_edit_row(self, ref: str):
+    """Open the per-row edit dialog. Lets you change ANY property on a single
+    symbol, including Value/Footprint. Two-click commit."""
+    p = next((q for q in self.passives_data if q['ref'] == ref), None)
+    if not p:
+        return
+
+    dlg = tk.Toplevel(self)
+    dlg.title(f"Edit {p['ref']}")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    dlg.geometry("640x600")
+
+    ttk.Label(dlg, text=f"Editing {p['ref']} "
+                        f"({PASSIVE_TYPE_LABEL[p['type']]})",
+              font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 4))
+    ttk.Label(dlg, text="Edit any field. Empty fields will be left untouched. "
+                        "Filled fields will be applied. You'll be asked to "
+                        "confirm changes before write.",
+              foreground=COLORS['text_muted'],
+              wraplength=600, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+
+    # Show all current properties + the standard fields for the part type
+    standard_keys = ['Value', 'Footprint'] + \
+                    [k for _, k in PASSIVE_FIELD_MAP[p['type']]]
+    seen = set()
+    rows = []
+    for k in standard_keys:
+        if k in seen: continue
+        seen.add(k)
+        if k == 'Value':
+            rows.append((k, p['value']))
+        elif k == 'Footprint':
+            rows.append((k, p['footprint_full']))
+        else:
+            rows.append((k, p['all_props'].get(k, '')))
+    # Plus any extra non-standard properties already on the symbol
+    for k, v in p['all_props'].items():
+        if k not in seen and k not in ('Reference',):
+            seen.add(k)
+            rows.append((k, v))
+
+    body = ttk.Frame(dlg); body.pack(fill="both", expand=True, padx=12, pady=4)
+    body.grid_columnconfigure(1, weight=1)
+
+    vars_ = {}
+    for r, (k, v) in enumerate(rows):
+        ttk.Label(body, text=k + ":").grid(row=r, column=0, sticky="e",
+                                            padx=(0, 6), pady=3)
+        sv = tk.StringVar(value=v)
+        vars_[k] = sv
+        ttk.Entry(body, textvariable=sv).grid(row=r, column=1, sticky="ew", pady=3)
+        # Show current value beside it
+        ttk.Label(body, text=f"current: {v!r}" if v else "(empty)",
+                  foreground=COLORS['text_muted'],
+                  font=("Segoe UI", 8)).grid(row=r, column=2,
+                                              sticky="w", padx=(6, 0))
+
+    btns = ttk.Frame(dlg); btns.pack(fill="x", padx=12, pady=12)
+
+    def do_save():
+        # Build diff: only fields that changed
+        changes = []
+        for k, sv in vars_.items():
+            new_val = sv.get().strip()
+            if k == 'Value':
+                old_val = p['value']
+            elif k == 'Footprint':
+                old_val = p['footprint_full']
+            else:
+                old_val = p['all_props'].get(k, '')
+            if new_val != old_val:
+                changes.append((k, old_val, new_val))
+        if not changes:
+            messagebox.showinfo("No Changes", "Nothing to apply.", parent=dlg)
+            return
+        # Confirm
+        msg_lines = [f"Apply these {len(changes)} change(s) to {p['ref']}?", ""]
+        for k, old, new in changes:
+            msg_lines.append(f"  {k}: {old!r} → {new!r}")
+        if not messagebox.askyesno("Confirm Edit", "\n".join(msg_lines),
+                                    parent=dlg):
+            return
+
+        fields = {k: new for (k, _old, new) in changes}
+        result = apply_passives_updates(
+            [{'passive': p, 'fields': fields}])
+        if result['errors']:
+            messagebox.showerror("Edit Failed",
+                "\n".join(result['errors']), parent=dlg)
+            return
+        dlg.destroy()
+        self._passives_scan()  # refresh
+
+    ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+    ttk.Button(btns, text="Save Changes…", command=do_save,
+               style="Accent.TButton").pack(side="right", padx=4)
+
+
+# ───── Library Manager ───────────────────────────────────────────────────
+
+def _passives_open_library_manager(self):
+    """Modal dialog for browsing/editing/removing/import/export library entries."""
+    dlg = tk.Toplevel(self)
+    dlg.title("Passives Library Manager")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    dlg.geometry("1000x650")
+
+    # Tabs by part type
+    nb = ttk.Notebook(dlg)
+    nb.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+
+    type_tabs = {}
+    for pt in ('R', 'C', 'L'):
+        f = ttk.Frame(nb); nb.add(f, text=f"  {PASSIVE_TYPE_LABEL[pt]}s  ")
+        type_tabs[pt] = f
+
+    # Build each tab
+    trees = {}
+    for pt, frame in type_tabs.items():
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        cols = ('value', 'package', 'extras', 'mpn', 'lcsc', 'mfg')
+        tv = ttk.Treeview(frame, columns=cols, show="headings", height=18)
+        tv.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        tv.configure(yscrollcommand=vsb.set)
+        for c, h, w in [('value','Value',100), ('package','Package',180),
+                        ('extras','Specs',260), ('mpn','MPN',180),
+                        ('lcsc','LCSC',100), ('mfg','Mfg',120)]:
+            tv.heading(c, text=h)
+            tv.column(c, width=w, anchor="w")
+        trees[pt] = tv
+
+    def refresh():
+        for pt, tv in trees.items():
+            for iid in tv.get_children():
+                tv.delete(iid)
+            for entry in self.passives_library.get(PASSIVE_LIB_KEY[pt], []):
+                extras = []
+                if pt == 'C':
+                    if entry.get('voltage'):    extras.append(entry['voltage'])
+                    if entry.get('dielectric'): extras.append(entry['dielectric'])
+                    if entry.get('tolerance'):  extras.append(entry['tolerance'])
+                elif pt == 'R':
+                    if entry.get('tolerance'):  extras.append(entry['tolerance'])
+                    if entry.get('power'):      extras.append(entry['power'])
+                    if entry.get('voltage'):    extras.append(entry['voltage'])
+                    if entry.get('type'):       extras.append(entry['type'])
+                elif pt == 'L':
+                    if entry.get('isat'): extras.append(f"Isat {entry['isat']}")
+                    if entry.get('dcr'):  extras.append(f"DCR {entry['dcr']}")
+                    if entry.get('core'): extras.append(entry['core'])
+                tv.insert("", "end", iid=entry['id'],
+                          values=(entry.get('value',''),
+                                  footprint_short(entry.get('package','')),
+                                  ' '.join(extras),
+                                  entry.get('mpn',''),
+                                  entry.get('lcsc',''),
+                                  entry.get('manufacturer','')))
+    refresh()
+
+    # Bottom buttons
+    btns = ttk.Frame(dlg); btns.pack(fill="x", padx=12, pady=8)
+
+    def current_pt():
+        idx = nb.index(nb.select())
+        return ('R', 'C', 'L')[idx]
+
+    def add_entry():
+        pt = current_pt()
+        self._passives_show_library_entry_dialog(
+            part_type=pt, initial={},
+            on_save=lambda part_type, entry: (
+                self._passives_persist_new_entry(part_type, entry), refresh()),
+            title=f"Add {PASSIVE_TYPE_LABEL[pt]} Entry")
+
+    def edit_entry():
+        pt = current_pt()
+        sel = trees[pt].focus()
+        if not sel:
+            messagebox.showinfo("No Selection", "Pick an entry to edit.", parent=dlg)
+            return
+        bucket = PASSIVE_LIB_KEY[pt]
+        entry = next((e for e in self.passives_library.get(bucket, [])
+                      if e.get('id') == sel), None)
+        if not entry: return
+
+        def do_update(part_type, new_entry):
+            # Replace entry in-place
+            new_entry['id'] = sel
+            for i, e in enumerate(self.passives_library[bucket]):
+                if e.get('id') == sel:
+                    self.passives_library[bucket][i] = new_entry
+                    break
+            passives_library_save(self.passives_library)
+            refresh()
+            self._passives_update_selection_panel()
+
+        self._passives_show_library_entry_dialog(
+            part_type=pt, initial=entry, on_save=do_update,
+            title=f"Edit {PASSIVE_TYPE_LABEL[pt]} Entry",
+            existing_id=sel)
+
+    def remove_entry():
+        pt = current_pt()
+        sel = trees[pt].focus()
+        if not sel:
+            messagebox.showinfo("No Selection", "Pick an entry to remove.", parent=dlg)
+            return
+        bucket = PASSIVE_LIB_KEY[pt]
+        entry = next((e for e in self.passives_library.get(bucket, [])
+                      if e.get('id') == sel), None)
+        if not entry: return
+        if not messagebox.askyesno("Remove Entry",
+                f"Remove {entry.get('value','?')} "
+                f"({entry.get('mpn','?')}) from library?", parent=dlg):
+            return
+        self.passives_library[bucket] = [
+            e for e in self.passives_library[bucket] if e.get('id') != sel]
+        passives_library_save(self.passives_library)
+        refresh()
+        self._passives_update_selection_panel()
+
+    def export_lib():
+        fname = filedialog.asksaveasfilename(
+            title="Export Library", defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+            initialfile="passives_library.json", parent=dlg)
+        if not fname:
+            return
+        try:
+            Path(fname).write_text(
+                json.dumps(self.passives_library, indent=2, ensure_ascii=False),
+                encoding='utf-8')
+            messagebox.showinfo("Exported",
+                f"Exported {sum(len(self.passives_library.get(b, []))
+                                 for b in ('resistors','capacitors','inductors'))} "
+                f"entries to:\n{fname}", parent=dlg)
+        except OSError as e:
+            messagebox.showerror("Export Failed", str(e), parent=dlg)
+
+    def import_lib():
+        fname = filedialog.askopenfilename(
+            title="Import Library", filetypes=[("JSON","*.json"),("All Files","*.*")],
+            parent=dlg)
+        if not fname:
+            return
+        try:
+            data = json.loads(Path(fname).read_text(encoding='utf-8'))
+        except Exception as e:
+            messagebox.showerror("Import Failed",
+                f"Could not parse JSON:\n{e}", parent=dlg)
+            return
+        choice = messagebox.askyesnocancel("Import Mode",
+            "Yes  = Merge into current library (skip duplicate ids)\n"
+            "No   = Replace current library\n"
+            "Cancel = Abort", parent=dlg)
+        if choice is None:
+            return
+        if not choice:
+            self.passives_library = {'version': 1, 'resistors': [],
+                                       'capacitors': [], 'inductors': []}
+        for bucket in ('resistors', 'capacitors', 'inductors'):
+            existing_ids = {e.get('id') for e in
+                            self.passives_library.get(bucket, [])}
+            for e in data.get(bucket, []):
+                if e.get('id') not in existing_ids:
+                    self.passives_library.setdefault(bucket, []).append(e)
+        passives_library_save(self.passives_library)
+        refresh()
+        self._passives_update_selection_panel()
+
+    ttk.Button(btns, text="➕ Add",     command=add_entry).pack(side="left", padx=2)
+    ttk.Button(btns, text="✏ Edit",    command=edit_entry).pack(side="left", padx=2)
+    ttk.Button(btns, text="🗑 Remove",  command=remove_entry).pack(side="left", padx=2)
+    ttk.Button(btns, text="📤 Export…", command=export_lib).pack(side="left", padx=12)
+    ttk.Button(btns, text="📥 Import…", command=import_lib).pack(side="left", padx=2)
+    ttk.Label(btns, text=f"  Library file: {PASSIVES_LIB_FILE}",
+              foreground=COLORS['text_muted']).pack(side="left", padx=12)
+    ttk.Button(btns, text="Close", command=dlg.destroy).pack(side="right", padx=2)
+
+
+# ─── Save All Complete to Library — bulk walkthrough ─────────────────────
+
+def _passives_save_all_complete(self):
+    """Walk every unique (type, value_norm, package_short, MPN) in the scan
+    that has Value+Footprint+MPN populated. Dedup against the existing
+    library. Walk the remainder through a pre-filled form."""
+    # Build set of keys already in library
+    seen_in_lib = set()
+    for pt, bucket_name in PASSIVE_LIB_KEY.items():
+        for entry in self.passives_library.get(bucket_name, []):
+            seen_in_lib.add((
+                pt,
+                normalize_passive_value(entry.get('value', '')),
+                footprint_short(entry.get('package', '')),
+                entry.get('mpn', ''),
+            ))
+
+    # Build queue from scan, deduped against library and against itself
+    seen_in_queue = set()
+    queue = []
+    for p in self.passives_data:
+        if not p['value'] or not p['footprint_full'] or not p['mpn']:
+            continue
+        key = (p['type'], p['value_norm'], p['footprint_short'], p['mpn'])
+        if key in seen_in_lib or key in seen_in_queue:
+            continue
+        seen_in_queue.add(key)
+        queue.append(p)
+
+    if not queue:
+        # Count what got filtered for a helpful message
+        total_complete = sum(1 for p in self.passives_data
+                              if p['value'] and p['footprint_full'] and p['mpn'])
+        messagebox.showinfo("Nothing to Save",
+            f"No new entries to save.\n\n"
+            f"Components with Value+Footprint+MPN: {total_complete}\n"
+            f"Unique (type, value, package, MPN) groups already in library: "
+            f"all of them.\n\n"
+            f"To re-edit an existing library entry, use "
+            f"📚 Manage Library… and click Edit.")
+        return
+
+    self._passives_run_save_queue(queue)
+
+
+def _passives_run_save_queue(self, queue):
+    """Show a sequential walkthrough dialog. One pre-filled form per queue
+    item with Save & Next / Skip / Save All Remaining (minimal) / Cancel."""
+    state = {'index': 0, 'queue': queue}
+
+    dlg = tk.Toplevel(self)
+    dlg.title("Save All Complete — Library Walkthrough")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    dlg.geometry("620x680")
+
+    # Header — progress label
+    header = ttk.Frame(dlg)
+    header.pack(fill="x", padx=12, pady=(12, 6))
+    progress_var = tk.StringVar()
+    ttk.Label(header, textvariable=progress_var,
+              font=("Segoe UI", 11, "bold")).pack(side="left")
+
+    # Body — cleared and rebuilt for each item
+    body = ttk.Frame(dlg)
+    body.pack(fill="both", expand=True, padx=12, pady=4)
+
+    # Footer button row
+    btns = ttk.Frame(dlg); btns.pack(fill="x", padx=12, pady=10)
+
+    form_state = {'vars_': {}, 'part_type': None, 'sample': None}
+
+    def make_entry_from_passive(p, vars_=None):
+        """Build a library-entry dict. If vars_ given, read from form;
+        otherwise build minimal entry directly from the passive."""
+        if vars_ is not None:
+            entry = {k: v.get().strip() for k, v in vars_.items()}
+        else:
+            entry = {
+                'value':        p['value_norm'],
+                'package':      p['footprint_full'],
+                'mpn':          p['mpn'],
+                'lcsc':         p['lcsc'],
+                'manufacturer': p['all_props'].get('Manufacturer', ''),
+            }
+        return entry
+
+    def persist_entry(p, entry):
+        """Append a validated entry to the library (no file save yet)."""
+        entry['id'] = passives_library_next_id(self.passives_library, p['type'])
+        bucket_name = PASSIVE_LIB_KEY[p['type']]
+        self.passives_library.setdefault(bucket_name, []).append(entry)
+
+    def end_of_queue():
+        passives_library_save(self.passives_library)
+        dlg.destroy()
+        total = sum(len(self.passives_library.get(b, []))
+                     for b in ('resistors', 'capacitors', 'inductors'))
+        messagebox.showinfo("Walkthrough Complete",
+            f"Library now has {total} total entries.")
+        self._passives_update_selection_panel()
+
+    def render_current():
+        # Clear body
+        for child in body.winfo_children():
+            child.destroy()
+        body.grid_columnconfigure(1, weight=1)
+
+        idx = state['index']
+        if idx >= len(state['queue']):
+            end_of_queue()
+            return
+
+        p = state['queue'][idx]
+        form_state['part_type'] = p['type']
+        form_state['sample'] = p
+        progress_var.set(
+            f"{idx + 1} of {len(state['queue'])}  ·  "
+            f"{PASSIVE_TYPE_LABEL[p['type']]} {p['value']} / "
+            f"{p['footprint_short']}")
+
+        # Sub-header: which schematic components this entry will represent
+        matching_refs = [q['ref'] for q in self.passives_data
+                         if q['type'] == p['type']
+                         and q['value_norm'] == p['value_norm']
+                         and q['footprint_short'] == p['footprint_short']
+                         and q['mpn'] == p['mpn']]
+        refs_str = ', '.join(matching_refs[:12])
+        if len(matching_refs) > 12:
+            refs_str += f", … ({len(matching_refs)} total)"
+        ttk.Label(body, text=f"Schematic refs: {refs_str}",
+                  foreground=COLORS['text_muted'],
+                  wraplength=560, justify="left").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        # Pre-fill from schematic; required = Value/Package/MPN
+        initial = {
+            'value':        p['value_norm'],
+            'package':      p['footprint_full'],
+            'mpn':          p['mpn'],
+            'lcsc':         p['lcsc'],
+            'manufacturer': p['all_props'].get('Manufacturer', ''),
+        }
+        # Seed any spec fields already on the schematic
+        for kicad_name in ('Tolerance', 'Voltage', 'Dielectric', 'Type',
+                           'Power', 'Isat', 'Irms', 'DCR', 'SRF', 'Q', 'Core',
+                           'Datasheet'):
+            v = p['all_props'].get(kicad_name, '')
+            if v:
+                initial[kicad_name.lower()] = v
+
+        fields = PASSIVE_FORM_FIELDS[p['type']]
+        vars_ = {}
+        REQUIRED = {'value', 'package', 'mpn'}
+        pkg_values = _passives_known_packages(p['type'], self.passives_library)
+        for r, (key, label, hint) in enumerate(fields, start=1):
+            required_marker = " *" if key in REQUIRED else ""
+            ttk.Label(body, text=label + required_marker + ":").grid(
+                row=r, column=0, sticky="e", padx=(0, 6), pady=3)
+            sv = tk.StringVar(value=initial.get(key, ''))
+            vars_[key] = sv
+            if key == 'package':
+                ttk.Combobox(body, textvariable=sv, values=pkg_values).grid(
+                    row=r, column=1, sticky="ew", pady=3)
+            else:
+                ttk.Entry(body, textvariable=sv).grid(
+                    row=r, column=1, sticky="ew", pady=3)
+            if hint:
+                ttk.Label(body, text=hint, foreground=COLORS['text_muted'],
+                          font=("Segoe UI", 8)).grid(
+                    row=r, column=2, sticky="w", padx=(6, 0))
+
+        # Required field note at bottom of form
+        ttk.Label(body, text="*  required",
+                  foreground=COLORS['text_muted'],
+                  font=("Segoe UI", 8)).grid(
+            row=len(fields) + 1, column=0, columnspan=3,
+            sticky="w", pady=(6, 0))
+
+        form_state['vars_'] = vars_
+
+    def do_save_and_next():
+        p = form_state['sample']
+        vars_ = form_state['vars_']
+        entry = make_entry_from_passive(p, vars_)
+        if not entry.get('value') or not entry.get('package') \
+                or not entry.get('mpn'):
+            messagebox.showwarning("Missing Required Fields",
+                "Value, Package, and MPN are required.\n\n"
+                "Edit the fields, click Skip, or click Cancel.",
+                parent=dlg)
+            return
+        persist_entry(p, entry)
+        passives_library_save(self.passives_library)
+        state['index'] += 1
+        render_current()
+
+    def do_skip():
+        state['index'] += 1
+        render_current()
+
+    def do_save_all_remaining():
+        remaining = len(state['queue']) - state['index']
+        if not messagebox.askyesno("Save All Remaining",
+            f"Save the remaining {remaining} entries with only Value, "
+            f"Package, MPN, LCSC, and Manufacturer? Spec fields (Tolerance, "
+            f"Voltage, etc.) will be left blank. You can fill them in "
+            f"later via 📚 Manage Library…", parent=dlg):
+            return
+        for i in range(state['index'], len(state['queue'])):
+            p = state['queue'][i]
+            entry = make_entry_from_passive(p, vars_=None)
+            persist_entry(p, entry)
+        state['index'] = len(state['queue'])
+        render_current()  # triggers end-of-queue path
+
+    def do_cancel():
+        dlg.destroy()
+        # No file write needed — saves were committed incrementally.
+        self._passives_update_selection_panel()
+
+    ttk.Button(btns, text="Cancel", command=do_cancel).pack(side="left", padx=2)
+    ttk.Button(btns, text="Save All Remaining (minimal)",
+               command=do_save_all_remaining).pack(side="left", padx=12)
+    ttk.Button(btns, text="Skip", command=do_skip).pack(side="right", padx=2)
+    ttk.Button(btns, text="Save & Next", command=do_save_and_next,
+               style="Accent.TButton").pack(side="right", padx=2)
+
+    render_current()
+
+
+# ─── Bind passives methods to App class ────────────────────────────────────
+App._create_passives_tab               = _create_passives_tab
+App._passives_browse_schematic         = _passives_browse_schematic
+App._passives_scan                     = _passives_scan
+App._passives_refresh_table            = _passives_refresh_table
+App._passives_on_click                 = _passives_on_click
+App._passives_toggle_check             = _passives_toggle_check
+App._passives_check_visible            = _passives_check_visible
+App._passives_uncheck_all              = _passives_uncheck_all
+App._passives_update_selection_panel   = _passives_update_selection_panel
+App._passives_apply_manual             = _passives_apply_manual
+App._passives_apply_from_library       = _passives_apply_from_library
+App._passives_apply_fields_to_checked  = _passives_apply_fields_to_checked
+App._passives_confirm_overwrite        = _passives_confirm_overwrite
+App._passives_save_to_library          = _passives_save_to_library
+App._passives_persist_new_entry        = _passives_persist_new_entry
+App._passives_show_library_entry_dialog = _passives_show_library_entry_dialog
+App._passives_on_double_click          = _passives_on_double_click
+App._passives_edit_row_cmd             = _passives_edit_row_cmd
+App._passives_edit_row                 = _passives_edit_row
+App._passives_open_library_manager     = _passives_open_library_manager
+App._passives_save_all_complete        = _passives_save_all_complete
+App._passives_run_save_queue           = _passives_run_save_queue
 
 
 # ═══════════════════════════════════════════════════════════════════════════
