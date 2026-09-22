@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KiCad Library Tool v6.0
+KiCad Library Tool v6.1
 ═══════════════════════════════════════════════════════════════════════════════
 Modern, portable tool for managing KiCad component libraries.
 
@@ -13,7 +13,30 @@ Modern, portable tool for managing KiCad component libraries.
 • Library management tools
 • Modern dark theme, no external dependencies
 
-Version: 6.0.0 | Date: 2026-06-08 | License: MIT
+Version: 6.1.0 | Date: 2026-09-22 | License: MIT
+
+Changes since 6.0:
+  • NEW : "📥 Inbox" tab (first tab). Two side-by-side lists: your
+          browser Downloads folder (zips only by default, newest first,
+          files from the last 15 min highlighted) and the zips folder
+          (= the Import tab's Source directory, with an Imported/New
+          status column read from the import log). Move → (or double-
+          click) moves selected downloads into zips; ↩ moves a zip back;
+          🗑 sends a wrong download to the Recycle Bin. Both lists
+          auto-refresh every 2 s while the tab is visible. 📂 buttons open
+          either folder in Explorer/Finder.
+  • NEW : "Import Zips" on the Inbox tab runs the normal import with the
+          Import-tab options, but stays on the Inbox tab (no popup) and
+          lists every symbol from the run -- including ones that were
+          already in the library -- with its footprint. Double-click or
+          Ctrl+C copies the symbol name; right-click / buttons copy
+          Lib:Symbol, the footprint, or all names. "Full Summary…"
+          opens the usual detailed dialog on demand.
+  • NEW : Symbol-library nickname detection from sym-lib-table (used for
+          the Lib:Symbol copy), mirroring the footprint nickname logic.
+  • FIX : Tab-change handler used hard-coded tab indices; now matches by
+          label so inserting tabs can't break Library/3D auto-refresh.
+  • Prefs: Downloads folder and "zips only" filter are remembered.
 
 Changes since 5.8:
   • NEW : Package field is now a combobox with auto-complete. Drops down
@@ -95,6 +118,8 @@ import tempfile
 import zipfile
 import textwrap
 import csv
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any
 import tkinter as tk
@@ -1602,7 +1627,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         
-        self.title("⚡ KiCad Library Tool 6.0")
+        self.title("⚡ KiCad Library Tool 6.1")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         
@@ -1660,6 +1685,10 @@ class App(tk.Tk):
             pass
         self.autoset.set(prefs.get("autoset", True))
         self.skip_imported.set(prefs.get("skip_imported", True))
+        # Inbox tab: browser download folder + filter
+        self.downloads_dir = tk.StringVar(
+            value=prefs.get("downloads_dir", str(Path.home() / "Downloads")))
+        self.inbox_zips_only = tk.BooleanVar(value=prefs.get("inbox_zips_only", True))
         self.recent_sources = prefs.get("recent_sources", [])[:10]
         self.recent_personal = prefs.get("recent_personal", [])[:10]
         
@@ -1718,6 +1747,7 @@ class App(tk.Tk):
         notebook.pack(fill="both", expand=True, padx=0, pady=0)
         
         # Create tabs
+        tab_inbox = ttk.Frame(notebook)
         tab_import = ttk.Frame(notebook)
         tab_library = ttk.Frame(notebook)
         tab_3d = ttk.Frame(notebook)
@@ -1726,6 +1756,7 @@ class App(tk.Tk):
         tab_settings = ttk.Frame(notebook)
         tab_results = ttk.Frame(notebook)
         
+        notebook.add(tab_inbox, text=" 📥 Inbox ")
         notebook.add(tab_import, text=" 📁 Import ")
         notebook.add(tab_library, text=" 📚 Library ")
         notebook.add(tab_3d, text=" 🎲 3D Models ")
@@ -1734,6 +1765,7 @@ class App(tk.Tk):
         notebook.add(tab_settings, text=" ⚙️ Settings ")
         notebook.add(tab_results, text=" 📊 Results ")
         
+        self._create_inbox_tab(tab_inbox)
         self._create_import_tab(tab_import)
         self._create_library_tab(tab_library)
         self._create_3d_models_tab(tab_3d)
@@ -1745,17 +1777,22 @@ class App(tk.Tk):
         self.notebook = notebook
         
         # Auto-refresh library when tab is selected
+        # Match tabs by label, not index, so inserting a tab can't break this.
         def on_tab_change(event):
-            tab_id = notebook.index(notebook.select())
-            if tab_id == 1:  # Library tab
+            label = (notebook.tab(notebook.select(), "text") or "").lower()
+            if "inbox" in label:
+                self._inbox_refresh(force=True)
+            elif "library" in label:
                 self.refresh_library_browser()
-            elif tab_id == 2:  # 3D Models tab
+            elif "3d models" in label:
                 # Only auto-scan the first time the user lands on the tab
                 if not getattr(self, "_3d_tab_first_visit_done", False):
                     self._3d_tab_first_visit_done = True
                     self.after(50, self.scan_3d_models_tab)
         
         notebook.bind("<<NotebookTabChanged>>", on_tab_change)
+        # Start the Inbox auto-refresh loop (only does work while it's visible)
+        self.after(500, self._inbox_poll)
 
     
     def _create_import_tab(self, parent):
@@ -3224,8 +3261,11 @@ Features bug fixes and UI improvements.
     # MAIN IMPORT OPERATION
     # ═══════════════════════════════════════════════════════════════════════════
     
-    def run(self):
-        """Run the import process."""
+    def run(self, inbox: bool = False):
+        """Run the import process.
+
+        inbox=True (from the Inbox tab): stay on the Inbox tab, skip the modal
+        summary, and list the run's symbols inline for copy/paste."""
         source = Path(self.source.get()).expanduser()
         personal = Path(self.personal.get()).expanduser()
         
@@ -3416,6 +3456,12 @@ Features bug fixes and UI improvements.
         self.log_message(msg, "OK" if not total['err'] else "WARN")
         self.log_message(f"{'='*70}", "STEP")
         
+        # Kept so the Inbox tab's "Full Summary…" can reopen the dialog
+        self._last_run_args = (results, total, all_pkgs, skipped_already, log_obj)
+        if inbox:
+            self._inbox_show_results(results, total, all_pkgs, skipped_already)
+            return
+
         # Switch to the Results tab (look it up by label so adding new tabs
         # in future doesn't silently send the user to the wrong place)
         self._switch_to_tab("Results")
@@ -6068,6 +6114,8 @@ License: MIT
             "auto_detect_nickname": self.auto_nick.get(),
             "autoset": self.autoset.get(),
             "skip_imported": self.skip_imported.get(),
+            "downloads_dir": self.downloads_dir.get(),
+            "inbox_zips_only": self.inbox_zips_only.get(),
             "recent_sources": self.recent_sources,
             "recent_personal": self.recent_personal,
         }
@@ -8515,6 +8563,608 @@ App._passives_edit_row                 = _passives_edit_row
 App._passives_open_library_manager     = _passives_open_library_manager
 App._passives_save_all_complete        = _passives_save_all_complete
 App._passives_run_save_queue           = _passives_run_save_queue
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INBOX TAB — Downloads → zips → import → copy symbol names
+# ═══════════════════════════════════════════════════════════════════════════
+
+_INBOX_NEW_SECONDS = 15 * 60      # downloads newer than this are highlighted
+_INBOX_POLL_MS = 2000
+
+
+def _open_in_file_manager(path: Path, select: bool = False):
+    """Open a folder (or reveal a file) in Explorer / Finder / the desktop's
+    file manager."""
+    path = Path(path)
+    if os.name == "nt":
+        if select and path.exists():
+            subprocess.Popen(f'explorer /select,"{path}"')
+        else:
+            os.startfile(str(path))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)] if select else ["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent if select else path)])
+
+
+def _send_to_trash(path: Path) -> bool:
+    """Move a file to the Recycle Bin / Trash. Returns False if that isn't
+    possible on this platform (caller can then offer a permanent delete)."""
+    path = Path(path)
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                            ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                            ("fFlags", ctypes.c_uint16),
+                            ("fAnyOperationsAborted", wintypes.BOOL),
+                            ("hNameMappings", ctypes.c_void_p),
+                            ("lpszProgressTitle", wintypes.LPCWSTR)]
+            FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION = 0x3, 0x4, 0x10
+            FOF_ALLOWUNDO, FOF_NOERRORUI = 0x40, 0x400
+            op = SHFILEOPSTRUCTW()
+            op.wFunc = FO_DELETE
+            op.pFrom = str(path.resolve()) + "\0"   # must be double-NUL terminated
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+            rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            return rc == 0 and not op.fAnyOperationsAborted and not path.exists()
+        if sys.platform == "darwin":
+            p = str(path.resolve()).replace('"', '\\"')
+            r = subprocess.run(["osascript", "-e",
+                                f'tell application "Finder" to delete POSIX file "{p}"'],
+                               capture_output=True)
+            return r.returncode == 0
+        r = subprocess.run(["gio", "trash", str(path)], capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _detect_sym_nickname(personal_root: Path, sym_name: str = "symbols.kicad_sym"):
+    """Symbol-library counterpart of _detect_fp_nickname(): find the nickname
+    registered in sym-lib-table for this .kicad_sym file; fall back to the
+    file stem (KiCad's default when adding a library)."""
+    stem = sym_name[:-len(".kicad_sym")] if sym_name.lower().endswith(".kicad_sym") else sym_name
+    if not personal_root:
+        return stem or None
+    try:
+        target = (Path(personal_root) / sym_name).resolve()
+    except Exception:
+        return stem or None
+    vars_map = _kicad_path_vars(Path(personal_root))
+    target_norm = os.path.normcase(os.path.normpath(str(target)))
+    tables = [d / "sym-lib-table" for d in _all_kicad_config_dirs()]
+    tables.append(Path(personal_root) / "sym-lib-table")
+    tables.append(Path(personal_root).parent / "sym-lib-table")
+    for tbl in tables:
+        try:
+            if not tbl.exists():
+                continue
+            txt = tbl.read_text(encoding="utf-8", errors="ignore")
+            names = re.findall(r'\(name\s+"([^"]*)"\)', txt)
+            uris = re.findall(r'\(uri\s+"([^"]*)"\)', txt)
+            for name, uri in zip(names, uris):
+                cand = _expand_kicad_uri(uri, vars_map)
+                try:
+                    cp = Path(cand)
+                    if cp.exists() and cp.resolve().samefile(target):
+                        return name
+                except Exception:
+                    pass
+                if os.path.normcase(os.path.normpath(cand)) == target_norm:
+                    return name
+        except Exception:
+            pass
+    return stem or None
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def _fmt_mtime(ts: float) -> str:
+    dt = datetime.fromtimestamp(ts)
+    now = datetime.now()
+    if dt.date() == now.date():
+        return f"Today {dt:%H:%M}"
+    if (now.date() - dt.date()).days == 1:
+        return f"Yesterday {dt:%H:%M}"
+    return f"{dt:%Y-%m-%d %H:%M}"
+
+
+def _inbox_list_dir(folder: Path, zips_only: bool):
+    """[(name, size, mtime)] for regular files in folder, newest first."""
+    out = []
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    if not e.is_file():
+                        continue
+                    if zips_only and not e.name.lower().endswith(".zip"):
+                        continue
+                    st = e.stat()
+                    out.append((e.name, st.st_size, st.st_mtime))
+                except OSError:
+                    pass
+    except OSError:
+        return []
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out
+
+
+def _create_inbox_tab(self, parent):
+    """Downloads → zips mover, one-click import, and copyable symbol names."""
+    parent.grid_columnconfigure(0, weight=1)
+    parent.grid_rowconfigure(1, weight=2)
+    parent.grid_rowconfigure(3, weight=3)
+
+    self._inbox_sig = {"dl": None, "zip": None}
+
+    # ── Folders ──────────────────────────────────────────────────────────
+    lf = ttk.Labelframe(parent, text="Folders", padding=12)
+    lf.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+    lf.grid_columnconfigure(1, weight=1)
+
+    ttk.Label(lf, text="Downloads:").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+    ttk.Entry(lf, textvariable=self.downloads_dir).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+    ttk.Button(lf, text="📁 Browse", command=self._inbox_pick_downloads).grid(row=0, column=2, padx=2)
+    ttk.Button(lf, text="📂 Open", command=lambda: self._inbox_open_dir(self.downloads_dir.get())
+               ).grid(row=0, column=3, padx=2)
+
+    ttk.Label(lf, text="Zips (import source):").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+    ttk.Entry(lf, textvariable=self.source).grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+    ttk.Button(lf, text="📁 Browse", command=self.pick_source).grid(row=1, column=2, padx=2)
+    ttk.Button(lf, text="📂 Open", command=lambda: self._inbox_open_dir(self.source.get())
+               ).grid(row=1, column=3, padx=2)
+
+    # ── Two file lists ───────────────────────────────────────────────────
+    lists = ttk.Frame(parent)
+    lists.grid(row=1, column=0, sticky="nsew", padx=16, pady=4)
+    lists.grid_columnconfigure(0, weight=1, uniform="lists")
+    lists.grid_columnconfigure(1, weight=0)
+    lists.grid_columnconfigure(2, weight=1, uniform="lists")
+    lists.grid_rowconfigure(0, weight=1)
+
+    def make_tree(container, title, extra_cols=()):
+        f = ttk.Labelframe(container, text=title, padding=8)
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(0, weight=1)
+        cols = ("name", "size", "modified") + tuple(c for c, _, _ in extra_cols)
+        tv = ttk.Treeview(f, columns=cols, show="headings", selectmode="extended", height=8)
+        tv.heading("name", text="File"); tv.column("name", width=260, anchor="w")
+        tv.heading("size", text="Size"); tv.column("size", width=70, anchor="e", stretch=False)
+        tv.heading("modified", text="Modified"); tv.column("modified", width=120, anchor="w", stretch=False)
+        for c, label, w in extra_cols:
+            tv.heading(c, text=label); tv.column(c, width=w, anchor="center", stretch=False)
+        tv.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(f, orient="vertical", command=tv.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        tv.configure(yscrollcommand=sb.set)
+        tv.tag_configure("fresh", foreground=COLORS['success'])
+        tv.tag_configure("imported", foreground=COLORS['text_muted'])
+        tv.tag_configure("new", foreground=COLORS['success'])
+        return f, tv
+
+    dl_frame, self.inbox_dl_tree = make_tree(lists, "⬇ Downloads")
+    dl_frame.grid(row=0, column=0, sticky="nsew")
+    zip_frame, self.inbox_zip_tree = make_tree(lists, "🗜 Zips", extra_cols=(("status", "Status", 90),))
+    zip_frame.grid(row=0, column=2, sticky="nsew")
+
+    mid = ttk.Frame(lists)
+    mid.grid(row=0, column=1, padx=8)
+    ttk.Button(mid, text="Move →", style="Accent.TButton",
+               command=self._inbox_move_to_zips).pack(fill="x", pady=4)
+    ttk.Button(mid, text="↩ Back", command=self._inbox_move_back).pack(fill="x", pady=4)
+
+    dl_btns = ttk.Frame(dl_frame)
+    dl_btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Button(dl_btns, text="🗑 Delete", command=self._inbox_delete_downloads).pack(side="left", padx=2)
+    ttk.Button(dl_btns, text="↻", width=3, command=lambda: self._inbox_refresh(force=True)
+               ).pack(side="left", padx=2)
+    ttk.Checkbutton(dl_btns, text="Zips only", variable=self.inbox_zips_only,
+                    command=lambda: (self.save_prefs(), self._inbox_refresh(force=True))
+                    ).pack(side="left", padx=(8, 0))
+    ttk.Label(dl_btns, text="green = last 15 min", foreground=COLORS['text_muted']
+              ).pack(side="right")
+
+    zip_btns = ttk.Frame(zip_frame)
+    zip_btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Button(zip_btns, text="  ▶️ Import Zips  ", style="Accent.TButton",
+               command=self._inbox_run_import).pack(side="left", padx=2)
+    ttk.Button(zip_btns, text="↻", width=3, command=lambda: self._inbox_refresh(force=True)
+               ).pack(side="left", padx=2)
+    ttk.Label(zip_btns, text="Uses Import-tab options", foreground=COLORS['text_muted']
+              ).pack(side="right")
+
+    # Double-click acts only on a row (not a column header or empty space)
+    def on_row(tree, fn):
+        return lambda e: fn() if tree.identify_row(e.y) else None
+    self.inbox_dl_tree.bind("<Double-1>", on_row(self.inbox_dl_tree, self._inbox_move_to_zips))
+    self.inbox_dl_tree.bind("<Delete>", lambda e: self._inbox_delete_downloads())
+    self.inbox_zip_tree.bind("<Double-1>", on_row(self.inbox_zip_tree, self._inbox_reveal_zip))
+
+    # ── Status line ──────────────────────────────────────────────────────
+    self.inbox_status = tk.StringVar(value="Move new part zips over, then Import Zips.")
+    ttk.Label(parent, textvariable=self.inbox_status, foreground=COLORS['text_muted']
+              ).grid(row=2, column=0, sticky="w", padx=20, pady=(4, 0))
+
+    # ── Symbols from the last run ────────────────────────────────────────
+    rf = ttk.Labelframe(parent, text="Symbols from last import  —  double-click or Ctrl+C to copy name",
+                        padding=8)
+    rf.grid(row=3, column=0, sticky="nsew", padx=16, pady=(6, 16))
+    rf.grid_columnconfigure(0, weight=1)
+    rf.grid_rowconfigure(0, weight=1)
+
+    cols = ("symbol", "footprint", "change", "package")
+    tv = ttk.Treeview(rf, columns=cols, show="headings", selectmode="extended", height=8)
+    tv.heading("symbol", text="Symbol"); tv.column("symbol", width=260, anchor="w")
+    tv.heading("footprint", text="Footprint"); tv.column("footprint", width=320, anchor="w")
+    tv.heading("change", text="Result"); tv.column("change", width=200, anchor="w")
+    tv.heading("package", text="Package"); tv.column("package", width=240, anchor="w")
+    tv.grid(row=0, column=0, sticky="nsew")
+    sb = ttk.Scrollbar(rf, orient="vertical", command=tv.yview)
+    sb.grid(row=0, column=1, sticky="ns")
+    tv.configure(yscrollcommand=sb.set)
+    tv.tag_configure("new", foreground=COLORS['success'])
+    tv.tag_configure("warn", foreground=COLORS['warning'])
+    tv.tag_configure("existing", foreground=COLORS['text'])
+    tv.tag_configure("err", foreground=COLORS['error'])
+    self.inbox_sym_tree = tv
+
+    tv.bind("<Double-1>", lambda e: self._inbox_copy("symbol") if tv.identify_row(e.y) else None)
+    tv.bind("<Control-c>", lambda e: self._inbox_copy("symbol"))
+    menu = tk.Menu(self, tearoff=0, bg=COLORS['panel'], fg=COLORS['text'],
+                   activebackground=COLORS['accent'], activeforeground='white')
+    menu.add_command(label="Copy Symbol Name", command=lambda: self._inbox_copy("symbol"))
+    menu.add_command(label="Copy Lib:Symbol", command=lambda: self._inbox_copy("libsym"))
+    menu.add_command(label="Copy Footprint", command=lambda: self._inbox_copy("footprint"))
+
+    def popup(e):
+        row = tv.identify_row(e.y)
+        if row and row not in tv.selection():
+            tv.selection_set(row)
+        if row:
+            menu.post(e.x_root, e.y_root)
+    tv.bind("<Button-3>", popup)
+
+    rb = ttk.Frame(rf)
+    rb.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Button(rb, text="📋 Copy Symbol", command=lambda: self._inbox_copy("symbol")).pack(side="left", padx=2)
+    ttk.Button(rb, text="📋 Copy Lib:Symbol", command=lambda: self._inbox_copy("libsym")).pack(side="left", padx=2)
+    ttk.Button(rb, text="📋 Copy Footprint", command=lambda: self._inbox_copy("footprint")).pack(side="left", padx=2)
+    ttk.Button(rb, text="📋 Copy All Names", command=lambda: self._inbox_copy("symbol", all_rows=True)
+               ).pack(side="left", padx=2)
+    ttk.Button(rb, text="📄 Full Summary…", command=self._inbox_full_summary).pack(side="right", padx=2)
+
+    # Re-list the zips pane when the source path changes (typed or browsed)
+    try:
+        self.source.trace_add("write", lambda *a: self.after_idle(lambda: self._inbox_refresh(force=True)))
+    except Exception:
+        pass
+
+
+# ─── File lists ──────────────────────────────────────────────────────────
+def _inbox_is_visible(self) -> bool:
+    try:
+        return "inbox" in (self.notebook.tab(self.notebook.select(), "text") or "").lower()
+    except Exception:
+        return False
+
+
+def _inbox_poll(self):
+    """Cheap 2 s poll; only touches the widgets when a listing changed."""
+    try:
+        if self._inbox_is_visible():
+            self._inbox_refresh()
+    except Exception:
+        pass
+    self.after(_INBOX_POLL_MS, self._inbox_poll)
+
+
+def _inbox_fill(tree, rows, sig_key, sig_store, row_builder):
+    sig = tuple(rows)
+    if sig_store.get(sig_key) == sig:
+        return False
+    sig_store[sig_key] = sig
+    selected = set(tree.selection())
+    top = tree.yview()[0]
+    tree.delete(*tree.get_children())
+    for r in rows:
+        values, tags = row_builder(r)
+        tree.insert("", "end", iid=r[0], values=values, tags=tags)
+    keep = [i for i in selected if tree.exists(i)]
+    if keep:
+        tree.selection_set(keep)
+    tree.yview_moveto(top)
+    return True
+
+
+def _inbox_refresh(self, force: bool = False):
+    if force:
+        self._inbox_sig = {"dl": None, "zip": None}
+    now = time.time()
+
+    dl = Path(self.downloads_dir.get()).expanduser() if self.downloads_dir.get() else None
+    dl_rows = _inbox_list_dir(dl, self.inbox_zips_only.get()) if dl and dl.is_dir() else []
+
+    def dl_row(r):
+        name, size, mt = r
+        return (name, _fmt_size(size), _fmt_mtime(mt)), (("fresh",) if now - mt < _INBOX_NEW_SECONDS else ())
+    _inbox_fill(self.inbox_dl_tree, dl_rows, "dl", self._inbox_sig, dl_row)
+
+    zd = Path(self.source.get()).expanduser() if self.source.get() else None
+    zip_rows = _inbox_list_dir(zd, True) if zd and zd.is_dir() else []
+    # Fold the import-log state into the signature so status flips after an import
+    log_obj = ImportLog(Path(self.personal.get()).expanduser()) if self.personal.get() else None
+    zip_rows = [(n, s, m, bool(log_obj and log_obj.contains("zip", zd / n))) for n, s, m in zip_rows]
+
+    def zip_row(r):
+        name, size, mt, done = r
+        return ((name, _fmt_size(size), _fmt_mtime(mt), "✓ Imported" if done else "● New"),
+                ("imported",) if done else ("new",))
+    _inbox_fill(self.inbox_zip_tree, zip_rows, "zip", self._inbox_sig, zip_row)
+
+
+def _inbox_pick_downloads(self):
+    init = self.downloads_dir.get() or str(Path.home())
+    p = filedialog.askdirectory(title="Select Downloads Folder", initialdir=init)
+    if p:
+        self.downloads_dir.set(p)
+        self.save_prefs()
+        self._inbox_refresh(force=True)
+
+
+def _inbox_open_dir(self, path_str: str):
+    if not path_str:
+        messagebox.showinfo("Open Folder", "No folder set.")
+        return
+    p = Path(path_str).expanduser()
+    if not p.is_dir():
+        messagebox.showerror("Open Folder", f"Folder not found:\n{p}")
+        return
+    try:
+        _open_in_file_manager(p)
+    except Exception as e:
+        messagebox.showerror("Open Folder", str(e))
+
+
+def _inbox_reveal_zip(self):
+    sel = self.inbox_zip_tree.selection()
+    if sel and self.source.get():
+        try:
+            _open_in_file_manager(Path(self.source.get()).expanduser() / sel[0], select=True)
+        except Exception as e:
+            messagebox.showerror("Show in Folder", str(e))
+
+
+# ─── Move / delete ───────────────────────────────────────────────────────
+def _inbox_move(self, names, src_dir: Path, dst_dir: Path, verb: str):
+    moved, skipped, errors = [], [], []
+    for name in names:
+        src, dst = src_dir / name, dst_dir / name
+        try:
+            if not src.exists():
+                continue
+            if dst.exists():
+                if not messagebox.askyesno(
+                        "File exists",
+                        f"'{name}' already exists in\n{dst_dir}\n\nReplace it?", parent=self):
+                    skipped.append(name)
+                    continue
+                dst.unlink()
+            shutil.move(str(src), str(dst))
+            moved.append(name)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    msg = f"{verb} {len(moved)} file(s)"
+    if skipped:
+        msg += f", skipped {len(skipped)}"
+    if len(moved) == 1:
+        msg += f": {moved[0]}"
+    self.inbox_status.set(msg)
+    if errors:
+        messagebox.showerror("Move", "\n".join(errors))
+    self._inbox_refresh(force=True)
+    for tree in (self.inbox_zip_tree, self.inbox_dl_tree):
+        keep = [n for n in moved if tree.exists(n)]
+        if keep:
+            tree.selection_set(keep)
+            tree.see(keep[0])
+    return moved
+
+
+def _inbox_move_to_zips(self):
+    names = list(self.inbox_dl_tree.selection())
+    if not names:
+        self.inbox_status.set("Select one or more downloads to move.")
+        return
+    if not self.source.get():
+        messagebox.showerror("Move", "Set the Zips folder first.")
+        return
+    dl = Path(self.downloads_dir.get()).expanduser()
+    zd = Path(self.source.get()).expanduser()
+    if not zd.exists():
+        if not messagebox.askyesno("Create folder?", f"Zips folder doesn't exist:\n{zd}\n\nCreate it?"):
+            return
+        zd.mkdir(parents=True, exist_ok=True)
+    self._inbox_move(names, dl, zd, "Moved")
+
+
+def _inbox_move_back(self):
+    names = list(self.inbox_zip_tree.selection())
+    if not names:
+        self.inbox_status.set("Select one or more zips to move back to Downloads.")
+        return
+    dl = Path(self.downloads_dir.get()).expanduser()
+    if not dl.is_dir():
+        messagebox.showerror("Move", f"Downloads folder not found:\n{dl}")
+        return
+    self._inbox_move(names, Path(self.source.get()).expanduser(), dl, "Moved back")
+
+
+def _inbox_delete_downloads(self):
+    names = list(self.inbox_dl_tree.selection())
+    if not names:
+        self.inbox_status.set("Select one or more downloads to delete.")
+        return
+    dl = Path(self.downloads_dir.get()).expanduser()
+    listing = "\n".join(names[:10]) + (f"\n…and {len(names) - 10} more" if len(names) > 10 else "")
+    if not messagebox.askyesno("Delete", f"Send {len(names)} file(s) to the Recycle Bin?\n\n{listing}"):
+        return
+    trashed, failed = 0, []
+    for n in names:
+        if _send_to_trash(dl / n):
+            trashed += 1
+        else:
+            failed.append(n)
+    if failed and messagebox.askyesno(
+            "Recycle Bin unavailable",
+            f"{len(failed)} file(s) couldn't be sent to the Recycle Bin.\n"
+            "Delete them permanently instead?"):
+        for n in list(failed):
+            try:
+                (dl / n).unlink()
+                trashed += 1
+                failed.remove(n)
+            except Exception:
+                pass
+    self.inbox_status.set(f"Deleted {trashed} file(s)" + (f", {len(failed)} failed" if failed else ""))
+    self._inbox_refresh(force=True)
+
+
+# ─── Import + symbol list ────────────────────────────────────────────────
+def _inbox_run_import(self):
+    zd = Path(self.source.get()).expanduser() if self.source.get() else None
+    if not zd or not zd.is_dir():
+        messagebox.showerror("Import", "Zips folder not found. Set it at the top of this tab.")
+        return
+    self.inbox_status.set("⚙️ Importing…")
+    self.update_idletasks()
+    self.run(inbox=True)
+    self._inbox_refresh(force=True)
+
+
+def _inbox_show_results(self, results, total, all_pkgs, skipped_already):
+    tv = self.inbox_sym_tree
+    tv.delete(*tv.get_children())
+
+    # Footprint for each symbol, read back from the library just written
+    fp_by_name = {}
+    try:
+        for name, block in list_symbols(self.current_sym_path()):
+            m = re.search(r'\(\s*property\s+"Footprint"\s+"([^"]*)"', block)
+            fp_by_name[name] = m.group(1) if m else ""
+    except Exception:
+        pass
+
+    labels = {"ADD": ("New", "new"), "RENAME": (None, "warn"), "REPLACE": ("Replaced existing", "warn"),
+              "SKIP_DUP": (None, "existing"), "SKIP_EXISTS": ("Already in library (same name)", "existing")}
+    n = 0
+    seen = set()
+    for r in results:
+        pkg = Path(r.get("package", "")).name
+        for orig, action, target in r.get("symbol_names_debug", []):
+            if action == "RENAME":
+                text = f"Renamed (from {orig})"
+            elif action == "SKIP_DUP":
+                text = "Already in library" if orig == target else f"Already in library as {target}"
+            else:
+                text = labels.get(action, (action, "existing"))[0]
+            tag = labels.get(action, (None, "existing"))[1]
+            key = (target, pkg)
+            if key in seen:
+                continue
+            seen.add(key)
+            n += 1
+            tv.insert("", "end", iid=f"r{n}", tags=(tag,),
+                      values=(target, fp_by_name.get(target, ""), text, pkg))
+        for e in r.get("errors", []):
+            n += 1
+            tv.insert("", "end", iid=f"r{n}", tags=("err",), values=("—", "", f"ERROR: {e}", pkg))
+
+    new = sum(len(r.get("symbols_added_names", [])) for r in results)
+    msg = f"Processed {len(results)} zip(s): {new} new symbol(s)"
+    if skipped_already:
+        msg += f"  ·  {len(skipped_already)} skipped (already imported)"
+    if total.get("err"):
+        msg += f"  ·  ⚠ {total['err']} error(s)"
+    if self.dry_run.get():
+        msg += "  ·  DRY RUN — nothing written"
+    if not results:
+        msg = ("Nothing new to import — every zip is already in the import log." if skipped_already
+               else "No packages found in the zips folder.")
+    self.inbox_status.set(msg)
+
+    kids = tv.get_children()
+    if kids:
+        tv.selection_set(kids[0])
+        tv.focus(kids[0])
+        tv.focus_set()
+
+
+def _inbox_copy(self, what: str, all_rows: bool = False):
+    tv = self.inbox_sym_tree
+    rows = tv.get_children() if all_rows else tv.selection()
+    items = []
+    lib = None
+    for iid in rows:
+        sym, fp, _change, _pkg = tv.item(iid, "values")
+        if sym in ("", "—"):
+            continue
+        if what == "footprint":
+            val = fp
+        elif what == "libsym":
+            if lib is None:
+                lib = _detect_sym_nickname(Path(self.personal.get()).expanduser(),
+                                           self.sym_choice.get()) or ""
+            val = f"{lib}:{sym}" if lib else sym
+        else:
+            val = sym
+        if val and val not in items:
+            items.append(val)
+    if not items:
+        self.inbox_status.set("Nothing selected to copy.")
+        return "break"
+    text = "\n".join(items)
+    self.clipboard_clear()
+    self.clipboard_append(text)
+    self.update()   # keeps the clipboard content after focus moves to KiCad
+    self.inbox_status.set(f"📋 Copied: {items[0]}" if len(items) == 1 else f"📋 Copied {len(items)} names")
+    return "break"
+
+
+def _inbox_full_summary(self):
+    args = getattr(self, "_last_run_args", None)
+    if not args:
+        messagebox.showinfo("Summary", "No import has been run yet this session.")
+        return
+    self._show_import_summary_dialog(*args)
+
+
+# ─── Bind inbox methods to App class ───────────────────────────────────────
+App._create_inbox_tab        = _create_inbox_tab
+App._inbox_is_visible        = _inbox_is_visible
+App._inbox_poll              = _inbox_poll
+App._inbox_refresh           = _inbox_refresh
+App._inbox_pick_downloads    = _inbox_pick_downloads
+App._inbox_open_dir          = _inbox_open_dir
+App._inbox_reveal_zip        = _inbox_reveal_zip
+App._inbox_move              = _inbox_move
+App._inbox_move_to_zips      = _inbox_move_to_zips
+App._inbox_move_back         = _inbox_move_back
+App._inbox_delete_downloads  = _inbox_delete_downloads
+App._inbox_run_import        = _inbox_run_import
+App._inbox_show_results      = _inbox_show_results
+App._inbox_copy              = _inbox_copy
+App._inbox_full_summary      = _inbox_full_summary
 
 
 # ═══════════════════════════════════════════════════════════════════════════
