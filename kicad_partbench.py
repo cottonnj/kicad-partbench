@@ -6305,12 +6305,12 @@ def parse_octopart_bom(bom_path: Path) -> List[dict]:
     Returns list of components with flexible column name recognition.
     Uses fallback method for Excel files to avoid openpyxl compatibility issues.
     """
-    # For CSV, use pandas
+    # For CSV, use the stdlib reader (utf-8-sig strips Excel's BOM)
     if bom_path.suffix.lower() == '.csv':
-        import pandas as pd
-        df = pd.read_csv(bom_path)
-        data = df.to_dict('records')
-        headers = list(df.columns)
+        with open(bom_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = list(reader.fieldnames or [])
+            data = list(reader)
     else:
         # For Excel, read XML directly to avoid openpyxl bugs
         import zipfile
