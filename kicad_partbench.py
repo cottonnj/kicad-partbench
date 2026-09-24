@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KiCad Library Tool v6.1
+KiCad PartBench v6.1  (formerly "KiCad Library Tool")
 ═══════════════════════════════════════════════════════════════════════════════
 Modern, portable tool for managing KiCad component libraries.
 
@@ -131,6 +131,9 @@ NONESSENTIAL_PROPS = {"Datasheet","Description","ki_description","ki_keywords","
                       "LCSC","LCSC Part","MPN","MFR","Manufacturer","Supplier","Supplier Part","Part Number",
                       "Link","URL","Alt","Notes"}
 PREFS_FILE = Path.home() / ".kicad_personal_importer.json"
+
+APP_NAME = "KiCad PartBench"
+APP_VERSION = "6.1.0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1631,12 +1634,12 @@ def apply_modern_theme(root):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
-    """Modern KiCad Library Tool application."""
+    """KiCad PartBench main window."""
     
     def __init__(self):
         super().__init__()
         
-        self.title("⚡ KiCad Library Tool 6.1")
+        self.title(f"⚡ {APP_NAME} {APP_VERSION}")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         
@@ -3006,7 +3009,7 @@ class App(tk.Tk):
         lf3 = ttk.Labelframe(parent, text="About", padding=16)
         lf3.grid(row=r, column=0, sticky="ew", padx=16, pady=8); r += 1
         
-        about_text = f"""KiCad Library Tool v5.0
+        about_text = f"""{APP_NAME} v{APP_VERSION}
         
 Modern, portable library manager for KiCad.
 No external dependencies required.
@@ -6078,7 +6081,7 @@ Features bug fixes and UI improvements.
     def show_about(self):
         """Show about dialog."""
         about = f"""
-KiCad Library Tool v5.0
+{APP_NAME} v{APP_VERSION}
 
 Modern, portable library manager for KiCad.
 
