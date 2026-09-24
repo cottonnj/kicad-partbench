@@ -8260,10 +8260,10 @@ def _passives_open_library_manager(self):
             Path(fname).write_text(
                 json.dumps(self.passives_library, indent=2, ensure_ascii=False),
                 encoding='utf-8')
+            n = sum(len(self.passives_library.get(b, []))
+                    for b in ('resistors', 'capacitors', 'inductors'))
             messagebox.showinfo("Exported",
-                f"Exported {sum(len(self.passives_library.get(b, []))
-                                 for b in ('resistors','capacitors','inductors'))} "
-                f"entries to:\n{fname}", parent=dlg)
+                f"Exported {n} entries to:\n{fname}", parent=dlg)
         except OSError as e:
             messagebox.showerror("Export Failed", str(e), parent=dlg)
 
