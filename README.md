@@ -111,6 +111,8 @@ Lists every symbol with its footprint, MPN, 3D model and pin count. The search b
 
 ### 🎲 3D Models
 
+> ⚠️ **Experimental.** This tab has known bugs and is incomplete. Check its results and back up your files before applying changes. See [#1](https://github.com/cottonnj/kicad-partbench/issues/1).
+
 ![3D Models](docs/screenshots/3d-models.png)
 
 Scans every footprint and checks each 3D model path. Scanning never changes any files.
@@ -120,6 +122,8 @@ Scans every footprint and checks each 3D model path. Scanning never changes any 
 - Double-click a row to search for a model by hand.
 
 ### 📋 BOM Manager
+
+> ⚠️ **Experimental.** This tab has known bugs and is incomplete. Check its results and back up your files before applying changes. See [#1](https://github.com/cottonnj/kicad-partbench/issues/1).
 
 ![BOM Manager](docs/screenshots/bom-manager.png)
 
@@ -132,6 +136,8 @@ Pushes the MPNs from an **Octopart BOM** (`.xlsx` or `.csv`) back into your KiCa
 The BOM needs a reference column (`Designator`, `Reference` or `Ref`) and an MPN column (`Matched Part Number`, `MPN` or `Part Number`). `Value`, `Footprint`, `Manufacturer`, `Datasheet` and `Description` columns are used if present.
 
 ### 🧩 Passives
+
+> ⚠️ **Experimental.** This tab has known bugs and is incomplete. Check its results and back up your files before applying changes. See [#1](https://github.com/cottonnj/kicad-partbench/issues/1).
 
 ![Passives](docs/screenshots/passives.png)
 
@@ -175,14 +181,20 @@ Close KiCad's symbol and footprint editors before applying changes, and keep you
 
 ## Development
 
-Everything is in `kicad_partbench.py`. The helpers above the `App` class (S-expression parsing, BOM and schematic parsing, value normalization) don't need a display and are covered by stdlib `unittest` tests:
+Everything is in `kicad_partbench.py`. The tests use only the standard library:
 
 ```bash
-python -m unittest discover -s tests -v
-ruff check .           # bug-class rules only; see ruff.toml
+python -m unittest discover -s tests -v     # add `xvfb-run -a` in front on a headless Linux box
+ruff check .                                # bug-class rules only; see ruff.toml
 ```
 
-CI runs both on Python 3.10–3.13 on Ubuntu and Windows. [CHANGELOG.md](CHANGELOG.md) has the version history.
+- `tests/test_core.py`: the parsing and normalization helpers, with no GUI.
+- `tests/test_features_*.py`: feature tests that start the real app against a throwaway **practice library** and click through each tab's buttons, then check what was written to disk. [`tests/practice_lib.py`](tests/practice_lib.py) builds that library (vendor ZIPs in three layouts, duplicate symbols, broken 3D paths, a hierarchical project, Octopart BOMs). [`tests/gui_harness.py`](tests/gui_harness.py) drives the app and records dialogs instead of showing them. The feature tests are skipped when no display is available.
+- Known bugs are tests marked `@unittest.expectedFailure` with a `# BUG:` comment. When you fix one, the test starts passing unexpectedly; remove its decorator.
+
+To poke at the practice library by hand: `python tests/practice_lib.py /tmp/practice`.
+
+CI runs everything on Python 3.10–3.13 on Ubuntu and Windows. [CHANGELOG.md](CHANGELOG.md) has the version history.
 
 ## License
 
