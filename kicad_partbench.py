@@ -1579,7 +1579,16 @@ def apply_modern_theme(root):
                    insertcolor=COLORS['text'], font=("Segoe UI", 10))
     style.configure("TCombobox", fieldbackground=COLORS['panel'], foreground=COLORS['text'], 
                    arrowcolor=COLORS['text'], font=("Segoe UI", 10))
-    
+    # clam paints readonly comboboxes light grey, which hides the light text
+    style.map("TCombobox",
+             fieldbackground=[("readonly", COLORS['panel'])],
+             foreground=[("readonly", COLORS['text'])],
+             selectbackground=[("readonly", COLORS['panel'])],
+             selectforeground=[("readonly", COLORS['text'])])
+    root.option_add("*TCombobox*Listbox.background", COLORS['panel'])
+    root.option_add("*TCombobox*Listbox.foreground", COLORS['text'])
+    root.option_add("*TCombobox*Listbox.selectBackground", COLORS['accent'])
+
     # Checkbuttons
     style.configure("TCheckbutton", background=COLORS['bg'], foreground=COLORS['text'], 
                    font=("Segoe UI", 10))
