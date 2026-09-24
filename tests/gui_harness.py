@@ -16,6 +16,7 @@ on a headless Linux box without Xvfb; run them with ``xvfb-run``).
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import tkinter as tk
@@ -60,6 +61,16 @@ class AppHarness:
         self._patches = []
 
         lib.home.mkdir(parents=True, exist_ok=True)
+        # Keep the app away from the real home, KiCad config and trash
+        env = mock.patch.dict(os.environ, {
+            "HOME": str(lib.home), "USERPROFILE": str(lib.home),
+            "APPDATA": str(lib.home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(lib.home / "AppData" / "Local"),
+            "XDG_CONFIG_HOME": str(lib.home / ".config"),
+            "XDG_DATA_HOME": str(lib.home / ".local" / "share"),
+        })
+        env.start()
+        self._patches.append(env)
         prefs_file = lib.home / ".kicad_personal_importer.json"
         prefs_file.write_text(__import__("json").dumps(lib.prefs), encoding="utf-8")
         pdir = lib.home / ".kicad-library-tool"
@@ -111,6 +122,9 @@ class AppHarness:
 
     def close(self):
         try:
+            # Cancel pending after() callbacks (Inbox poll, nickname detect, ...)
+            for aid in self.app.tk.splitlist(self.app.tk.call("after", "info")):
+                self.app.after_cancel(aid)
             for w in self.windows():
                 w.destroy()
             self.app.destroy()
