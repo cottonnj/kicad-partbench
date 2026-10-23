@@ -271,6 +271,7 @@ def json_copy(obj):
 
 CPL_HEADER = ["Designator", "Val", "Package", "Mid X", "Mid Y", "Rotation", "Layer"]
 CONN = "CONN-SMD_100P-P0.40_10164227-1001A1RLF"
+AMPHENOL = "10164227-1001A1RLF"
 CPL_ROWS = [
     ["C1", "100nF", "C_0402", "10.0", "20.0", "0.0", "top"],
     ["J7", "GT-B0403FSV14-100B1101", CONN, "33.999911", "86.101148", "0.0", "top"],
@@ -298,7 +299,7 @@ class PatchTests(unittest.TestCase):
     def test_patch_cpl(self):
         rows, diff = kp.patch_cpl(CPL_HEADER, CPL_ROWS, self.config, self.placements)
         self.assertEqual([r[0] for r in rows], ["C1", "J6", "J7", "R1"])
-        self.assertEqual(rows[1], ["J6", "GT-B0403FSV14-100B1101", CONN, "33.95", "120.26",
+        self.assertEqual(rows[1], ["J6", AMPHENOL, CONN, "33.95", "120.26",
                                    "0.0", "top"])
         self.assertEqual(rows[2][3:6], ["33.95", "86.26", "0.0"])
         kinds = {d["ref"]: d["kind"] for d in diff}
@@ -314,7 +315,7 @@ class PatchTests(unittest.TestCase):
         rows, diff = kp.patch_bom(BOM_HEADER, BOM_ROWS, self.config)
         self.assertEqual(rows, [
             ["100nF", "C1,C2", "C_0402", "C1525", "2"],
-            ["GT-B0403FSV14-100B1101", "J6,J7", CONN, "C42376244", "2"],
+            [AMPHENOL, "J6,J7", CONN, "C6782225", "2"],
             ["ComputeModule5-CM5", "U5", "Raspberry-Pi-5-Compute-Module", "", "1"],
             ["10k", "R1", "R_0402", "C25744", "1"],
         ])
@@ -329,7 +330,7 @@ class PatchTests(unittest.TestCase):
 
     def test_patch_bom_without_quantity_column(self):
         rows, _ = kp.patch_bom(BOM_HEADER[:4], [r[:4] for r in BOM_ROWS[:2]], self.config)
-        self.assertEqual(rows[1], ["GT-B0403FSV14-100B1101", "J6,J7", CONN, "C42376244"])
+        self.assertEqual(rows[1], [AMPHENOL, "J6,J7", CONN, "C6782225"])
 
     def test_keep_parent_when_asked(self):
         self.config["parents"][0]["drop_parent_from_cpl"] = False
