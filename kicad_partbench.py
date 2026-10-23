@@ -111,6 +111,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import shutil
 import hashlib
@@ -8575,6 +8576,580 @@ App._passives_edit_row                 = _passives_edit_row
 App._passives_open_library_manager     = _passives_open_library_manager
 App._passives_save_all_complete        = _passives_save_all_complete
 App._passives_run_save_queue           = _passives_run_save_queue
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-PART CPL — one schematic symbol, several placed parts
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Runs after the JLCPCB plugin (Bouni's kicad-jlcpcb-tools) has written
+# jlcpcb/production_files/{BOM,CPL}-<board>.csv. For each configured parent
+# footprint (e.g. a CM5 "Module1"), it drops the parent row and adds one row
+# per sub-part (e.g. the two 100-pin B2B connectors J6/J7), placed from the
+# parent's own pads in the .kicad_pcb.
+#
+# Positions follow the plugin's fabrication.py exactly: centre of the merged
+# pad bounding boxes, minus the aux origin, Y negated; rotation is the
+# footprint angle, mirrored (180 - a) on the bottom, plus a correction.
+#
+# Sub-part modes:
+#   pads    centre of the listed pads; xy_offset_mm is a nudge on top
+#   offset  xy_offset_mm from the parent origin, no pads needed
+# Both offsets are in the parent's own frame (like footprint-editor
+# coordinates), so they turn with the parent.
+#
+# Config: <project>.multipart.json next to the .kicad_pro
+# User presets: ~/.kicad-library-tool/multipart_presets.json
+# CSV backup: <file>.csv.bak before any write.
+# ═══════════════════════════════════════════════════════════════════════════
+
+MULTIPART_CONFIG_VERSION = 1
+CM5_PRESET = "Raspberry Pi CM5 (2× 100-pin B2B)"
+
+# Pad ranges match the CM5 datasheet numbering (101-200 is the second
+# connector). expect_local_mm is the measured connector centre in the CM5
+# footprint's frame; it is only a cross-check, the position comes from the pads.
+# Part and rotation are as ordered on M-050 Rev-4 (connectors at 0 with the
+# module at 90).
+MULTIPART_PRESETS: Dict[str, dict] = {
+    CM5_PRESET: {
+        "comment": "GT-B0403FSV14-100B1101",
+        "footprint": "CONN-SMD_100P-P0.40_10164227-1001A1RLF",
+        "lcsc": "C42376244",
+        "rotation_offset": -90,
+        "subparts": [
+            {"ref": "J6", "pads": "101-200", "expect_local_mm": [33.5, -21.5]},
+            {"ref": "J7", "pads": "1-100", "expect_local_mm": [-0.5, -21.5]},
+        ],
+    },
+}
+
+_MULTIPART_PRESET_TOLERANCE_MM = 0.1
+_SUBPART_DEFAULTS = {"mode": "pads", "pads": "", "comment": "", "footprint": "", "lcsc": "",
+                     "rotation_offset": 0, "xy_offset_mm": [0, 0]}
+
+# A quoted string (with escapes) or a single paren
+_SEXP_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[()]')
+_NUM = r'(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)'
+_AT_RE = re.compile(r'\(at\s+' + _NUM + r'\s+' + _NUM + r'(?:\s+' + _NUM + r')?')
+_SIZE_RE = re.compile(r'\(size\s+' + _NUM + r'\s+' + _NUM)
+_XY_RE = re.compile(r'\((start|end)\s+' + _NUM + r'\s+' + _NUM)
+
+
+def _sexp_unquote(s: str) -> str:
+    return re.sub(r'\\(.)', r'\1', s[1:-1])
+
+
+def _sexp_block_end(text: str, start: int) -> int:
+    """Index of the ')' closing the '(' at start, skipping quoted strings
+    (unlike _find_matching_paren). Returns -1 if unbalanced."""
+    depth = 0
+    for m in _SEXP_TOKEN_RE.finditer(text, start):
+        tok = m.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth == 0:
+                return m.start()
+    return -1
+
+
+def _sexp_children(block: str, head: str) -> List[str]:
+    """Direct child blocks of block (which starts with '(') named head."""
+    out = []
+    head_re = re.compile(r'\(' + re.escape(head) + r'[\s)]')
+    depth = 0
+    pos = block.find("(")
+    while True:
+        m = _SEXP_TOKEN_RE.search(block, pos)
+        if not m:
+            break
+        tok = m.group(0)
+        if tok == "(":
+            if depth == 1 and head_re.match(block, m.start()):
+                end = _sexp_block_end(block, m.start())
+                if end < 0:
+                    raise ValueError(f"unbalanced ({head} ...) block")
+                out.append(block[m.start():end + 1])
+                pos = end + 1
+                continue
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+        pos = m.end()
+    return out
+
+
+def parse_pad_spec(spec: str) -> Set[str]:
+    """'1-100' / '1-50,52,EP' -> set of pad numbers. Ranges are numeric only."""
+    pads: Set[str] = set()
+    if not spec.strip():
+        return pads
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"empty entry in pad list {spec!r}")
+        if "-" in part:
+            bits = part.split("-")
+            if len(bits) != 2 or not all(b.strip().isdigit() for b in bits):
+                raise ValueError(f"bad pad range {part!r} (ranges are numeric, e.g. 1-100)")
+            lo, hi = int(bits[0]), int(bits[1])
+            if lo > hi:
+                raise ValueError(f"reversed pad range {part!r}")
+            pads.update(str(n) for n in range(lo, hi + 1))
+        else:
+            pads.add(part)
+    return pads
+
+
+def _parse_pcb_footprint_block(block: str) -> dict:
+    lib = re.match(r'\(footprint\s+("(?:\\.|[^"\\])*")', block)
+    at = None
+    for child in _sexp_children(block, "at"):
+        at = _AT_RE.match(child)
+        break
+    layer = ""
+    for child in _sexp_children(block, "layer"):
+        m = re.match(r'\(layer\s+("(?:\\.|[^"\\])*")', child)
+        layer = _sexp_unquote(m.group(1)) if m else ""
+        break
+    ref = ""
+    for child in _sexp_children(block, "property"):
+        m = re.match(r'\(property\s+"Reference"\s+("(?:\\.|[^"\\])*")', child)
+        if m:
+            ref = _sexp_unquote(m.group(1))
+            break
+    if not ref:  # KiCad 5 style
+        for child in _sexp_children(block, "fp_text"):
+            m = re.match(r'\(fp_text\s+reference\s+("(?:\\.|[^"\\])*"|\S+)', child)
+            if m:
+                ref = _sexp_unquote(m.group(1)) if m.group(1).startswith('"') else m.group(1)
+                break
+    pads = []
+    for child in _sexp_children(block, "pad"):
+        m = re.match(r'\(pad\s+("(?:\\.|[^"\\])*"|\S+)\s+(\S+)\s+(\S+)', child)
+        pat, size = _AT_RE.search(child), _SIZE_RE.search(child)
+        if not (m and pat and size):
+            continue
+        num = m.group(1)
+        pads.append({
+            "number": _sexp_unquote(num) if num.startswith('"') else num,
+            "type": m.group(2), "shape": m.group(3),
+            "x": float(pat.group(1)), "y": float(pat.group(2)),
+            # Pad angles in the file are absolute (they include the footprint's)
+            "angle": float(pat.group(3) or 0),
+            "w": float(size.group(1)), "h": float(size.group(2)),
+        })
+    lines = []  # courtyard outline, local coordinates
+    for kind in ("fp_line", "fp_rect"):
+        for child in _sexp_children(block, kind):
+            if "CrtYd" not in child:
+                continue
+            pts = {k: (float(x), float(y)) for k, x, y in _XY_RE.findall(child)}
+            if "start" not in pts or "end" not in pts:
+                continue
+            (x1, y1), (x2, y2) = pts["start"], pts["end"]
+            if kind == "fp_line":
+                lines.append(((x1, y1), (x2, y2)))
+            else:
+                lines += [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)),
+                          ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]
+    return {
+        "ref": ref,
+        "lib_id": _sexp_unquote(lib.group(1)) if lib else "",
+        "x": float(at.group(1)) if at else 0.0,
+        "y": float(at.group(2)) if at else 0.0,
+        "angle": float(at.group(3) or 0) if at else 0.0,
+        "layer": layer,
+        "pads": pads,
+        "lines": lines,
+    }
+
+
+def parse_pcb_aux_origin(pcb_text: str) -> Tuple[float, float]:
+    """(setup (aux_axis_origin X Y)), default (0, 0)."""
+    m = re.search(r'\(aux_axis_origin\s+' + _NUM + r'\s+' + _NUM, pcb_text)
+    return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+
+
+def _pcb_footprints(pcb_text: str) -> List[dict]:
+    aux = parse_pcb_aux_origin(pcb_text)
+    out = []
+    for block in _sexp_children(pcb_text, "footprint"):
+        fp = _parse_pcb_footprint_block(block)
+        fp["aux"] = aux
+        out.append(fp)
+    return out
+
+
+def list_pcb_footprints(pcb_text: str) -> List[dict]:
+    """[{ref, lib_id, layer, pad_count}], most pads first."""
+    fps = [{"ref": f["ref"], "lib_id": f["lib_id"], "layer": f["layer"],
+            "pad_count": len(f["pads"])} for f in _pcb_footprints(pcb_text) if f["ref"]]
+    return sorted(fps, key=lambda f: (-f["pad_count"], _ref_sort_key(f["ref"])))
+
+
+def parse_pcb_footprint(pcb_text: str, ref: str) -> dict:
+    """Position, angle, layer, pads, courtyard lines and aux origin of one
+    footprint. Raises KeyError if ref is not on the board."""
+    for fp in _pcb_footprints(pcb_text):
+        if fp["ref"] == ref:
+            return fp
+    raise KeyError(f"{ref} is not on the board")
+
+
+def _fp_to_board(fp: dict, lx: float, ly: float) -> Tuple[float, float]:
+    """Footprint-local -> board (KiCad y-down, angle counter-clockwise on screen)."""
+    a = math.radians(fp["angle"])
+    c, s = math.cos(a), math.sin(a)
+    return fp["x"] + lx * c + ly * s, fp["y"] - lx * s + ly * c
+
+
+def _board_to_fp(fp: dict, bx: float, by: float) -> Tuple[float, float]:
+    a = math.radians(fp["angle"])
+    c, s = math.cos(a), math.sin(a)
+    dx, dy = bx - fp["x"], by - fp["y"]
+    return dx * c - dy * s, dx * s + dy * c
+
+
+def _pad_board_box(fp: dict, pad: dict) -> Tuple[float, float, float, float]:
+    cx, cy = _fp_to_board(fp, pad["x"], pad["y"])
+    if pad["shape"] == "circle":
+        hx = hy = pad["w"] / 2
+    else:  # rect/roundrect/oval/custom: box of the rotated size rectangle
+        a = math.radians(pad["angle"])
+        c, s = abs(math.cos(a)), abs(math.sin(a))
+        hx = pad["w"] / 2 * c + pad["h"] / 2 * s
+        hy = pad["w"] / 2 * s + pad["h"] / 2 * c
+    return cx - hx, cy - hy, cx + hx, cy + hy
+
+
+def footprint_pad_center(fp: dict, pads: Optional[List[dict]] = None) -> Tuple[float, float]:
+    """Board centre of the merged pad boxes (the plugin's get_position).
+    Falls back to the footprint origin when there are no pads."""
+    pads = fp["pads"] if pads is None else pads
+    if not pads:
+        return fp["x"], fp["y"]
+    boxes = [_pad_board_box(fp, p) for p in pads]
+    return ((min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2,
+            (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2)
+
+
+def jlc_rotation(fp: dict, offset: float = 0) -> float:
+    rot = fp["angle"] % 360
+    if not fp["layer"].startswith("F."):
+        rot = (180 - rot) % 360
+    return float((rot + offset) % 360) + 0.0
+
+
+def _subpart_with_defaults(sub: dict) -> dict:
+    out = dict(_SUBPART_DEFAULTS)
+    out.update(sub)
+    out["xy_offset_mm"] = list(out.get("xy_offset_mm") or [0, 0])
+    return out
+
+
+def subpart_placement(fp: dict, subpart: dict) -> dict:
+    """Board and CPL position + rotation for one sub-part of parent fp."""
+    sub = _subpart_with_defaults(subpart)
+    warnings = []
+    dx, dy = (float(v) for v in sub["xy_offset_mm"])
+    if sub["mode"] == "offset":
+        bx, by = _fp_to_board(fp, dx, dy)
+        pad_center = None
+    elif sub["mode"] == "pads":
+        wanted = parse_pad_spec(sub["pads"])
+        pads = [p for p in fp["pads"] if p["number"] in wanted]
+        if not pads:
+            raise ValueError(f"{sub['ref']}: none of pads {sub['pads']!r} are on {fp['ref']}")
+        missing = wanted - {p["number"] for p in pads}
+        if missing:
+            shown = ", ".join(sorted(missing, key=_ref_sort_key)[:8])
+            more = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+            warnings.append(f"{sub['ref']}: {fp['ref']} has no pad {shown}{more}")
+        pad_center = footprint_pad_center(fp, pads)
+        lx, ly = _board_to_fp(fp, *pad_center)
+        bx, by = _fp_to_board(fp, lx + dx, ly + dy)
+    else:
+        raise ValueError(f"{sub['ref']}: unknown mode {sub['mode']!r}")
+    ax, ay = fp["aux"]
+    return {
+        "ref": sub["ref"], "parent": fp["ref"],
+        "board_x": bx, "board_y": by,
+        "cpl_x": bx - ax, "cpl_y": -(by - ay),
+        "rotation": jlc_rotation(fp, float(sub["rotation_offset"])),
+        "layer": "top" if fp["layer"].startswith("F.") else "bottom",
+        "local": _board_to_fp(fp, bx, by),
+        "pad_center_local": _board_to_fp(fp, *pad_center) if pad_center else None,
+        "warnings": warnings,
+    }
+
+
+def apply_preset(preset: dict) -> List[dict]:
+    """Sub-part rows for the config, preset-level fields filled into each."""
+    shared = {k: preset[k] for k in ("comment", "footprint", "lcsc", "rotation_offset")
+              if k in preset}
+    return [_subpart_with_defaults({**shared, **sub}) for sub in preset.get("subparts", [])]
+
+
+def check_preset(placement: dict, subpart: dict) -> Optional[str]:
+    """Warning when the pad centre is not where the preset measured it."""
+    expect = subpart.get("expect_local_mm")
+    got = placement.get("pad_center_local")
+    if not expect or got is None:
+        return None
+    dist = math.hypot(got[0] - expect[0], got[1] - expect[1])
+    if dist <= _MULTIPART_PRESET_TOLERANCE_MM:
+        return None
+    return (f"{subpart['ref']}: pad centre is {dist:.2f} mm from where the preset expects it "
+            f"(got {got[0]:.2f}, {got[1]:.2f}; expected {expect[0]:.2f}, {expect[1]:.2f}). "
+            f"Different footprint origin, or the pad ranges are swapped?")
+
+
+def multipart_placements(pcb_text: str, config: dict) -> Tuple[Dict[str, dict], List[str]]:
+    """{sub-part ref: placement} for every parent in config, plus warnings."""
+    fps = {f["ref"]: f for f in _pcb_footprints(pcb_text)}
+    placements, warnings = {}, []
+    for parent in config.get("parents", []):
+        fp = fps.get(parent["ref"])
+        if fp is None:
+            raise KeyError(f"{parent['ref']} is not on the board")
+        for sub in parent.get("subparts", []):
+            p = subpart_placement(fp, sub)
+            placements[p["ref"]] = p
+            warnings += p["warnings"]
+            w = check_preset(p, sub)
+            if w:
+                warnings.append(w)
+    return placements, warnings
+
+
+def find_ghosts(pcb_text: str, config: dict, placements: Dict[str, dict]) -> List[dict]:
+    """Footprints on the board that use a sub-part's ref, and how far they are
+    from the computed position."""
+    out = []
+    for fp in _pcb_footprints(pcb_text):
+        p = placements.get(fp["ref"])
+        if p is None:
+            continue
+        gx, gy = footprint_pad_center(fp)
+        out.append({"ref": fp["ref"], "board_x": gx, "board_y": gy,
+                    "rotation": jlc_rotation(fp),
+                    "distance_mm": math.hypot(gx - p["board_x"], gy - p["board_y"])})
+    return out
+
+
+# ───── CSV patching ───────────────────────────────────────────────────────
+
+def _cpl_num(v: float) -> str:
+    return str(round(v, 6) + 0.0)
+
+
+def _remove_refs(config: dict) -> Tuple[Set[str], List[dict]]:
+    """(refs whose existing rows go away, all sub-parts in order)."""
+    refs, subs = set(), []
+    for parent in config.get("parents", []):
+        if parent.get("drop_parent_from_cpl", True):
+            refs.add(parent["ref"])
+        for sub in parent.get("subparts", []):
+            sub = _subpart_with_defaults(sub)
+            refs.add(sub["ref"])
+            subs.append(sub)
+    return refs, subs
+
+
+def _col(header: List[str], name: str) -> int:
+    try:
+        return header.index(name)
+    except ValueError:
+        raise ValueError(f"CSV has no {name!r} column (header: {', '.join(header)})")
+
+
+def patch_cpl(header: List[str], rows: List[List[str]], config: dict,
+              placements: Dict[str, dict]) -> Tuple[List[List[str]], List[dict]]:
+    """Drop parent rows, add or replace one row per sub-part. Other rows keep
+    their order; new rows go where the plugin's sort-by-reference puts them.
+    Returns (rows, diff) with diff entries {kind, ref, old, new}."""
+    ci = {n: _col(header, n) for n in ("Designator", "Val", "Package", "Mid X", "Mid Y",
+                                       "Rotation", "Layer")}
+    drop, subs = _remove_refs(config)
+    old = {r[ci["Designator"]]: r for r in rows if r and r[ci["Designator"]] in drop}
+    kept = [r for r in rows if not (r and r[ci["Designator"]] in drop)]
+    diff = []
+    for sub in subs:
+        p = placements[sub["ref"]]
+        new = [""] * len(header)
+        for name, value in (("Designator", sub["ref"]), ("Val", sub["comment"]),
+                            ("Package", sub["footprint"]), ("Mid X", _cpl_num(p["cpl_x"])),
+                            ("Mid Y", _cpl_num(p["cpl_y"])), ("Rotation", str(p["rotation"])),
+                            ("Layer", p["layer"])):
+            new[ci[name]] = value
+        at = next((i for i, r in enumerate(kept) if r and r[ci["Designator"]] > sub["ref"]),
+                  len(kept))
+        kept.insert(at, new)
+        prev = old.pop(sub["ref"], None)
+        kind = "added" if prev is None else ("unchanged" if prev == new else "replaced")
+        diff.append({"kind": kind, "ref": sub["ref"], "old": prev, "new": new})
+    for ref, prev in old.items():
+        diff.append({"kind": "removed", "ref": ref, "old": prev, "new": None})
+    return kept, diff
+
+
+def patch_bom(header: List[str], rows: List[List[str]],
+              config: dict) -> Tuple[List[List[str]], List[dict]]:
+    """Take sub-part and parent refs out of every BOM row (dropping rows left
+    empty), then add one row per (comment, footprint, LCSC) group of
+    sub-parts, in the slot of the first row that held any of its refs."""
+    ci = {n: _col(header, n) for n in ("Comment", "Designator", "Footprint", "LCSC")}
+    qi = header.index("Quantity") if "Quantity" in header else None
+    drop, subs = _remove_refs(config)
+    groups: Dict[Tuple[str, str, str], List[str]] = {}
+    for sub in subs:
+        groups.setdefault((sub["comment"], sub["footprint"], sub["lcsc"]), []).append(sub["ref"])
+    group_of = {ref: key for key, refs in groups.items() for ref in refs}
+
+    out: List[Optional[List[str]]] = []
+    slots: Dict[Tuple[str, str, str], int] = {}
+    slot_old: Dict[Tuple[str, str, str], List[str]] = {}
+    diff = []
+    for r in rows:
+        refs = [x.strip() for x in r[ci["Designator"]].split(",") if x.strip()] if r else []
+        hit = [x for x in refs if x in drop]
+        if not hit:
+            out.append(r)
+            continue
+        for ref in hit:
+            key = group_of.get(ref)
+            if key and key not in slots:
+                slots[key] = len(out)
+                slot_old[key] = r
+                out.append(None)  # filled below
+        left = [x for x in refs if x not in drop]
+        if left:
+            new = list(r)
+            new[ci["Designator"]] = ",".join(left)
+            if qi is not None:
+                new[qi] = str(len(left))
+            out.append(new)
+            diff.append({"kind": "changed", "ref": ",".join(hit), "old": r, "new": new})
+        elif not any(group_of.get(x) and slot_old.get(group_of[x]) is r for x in hit):
+            diff.append({"kind": "removed", "ref": ",".join(hit), "old": r, "new": None})
+    for key, refs in groups.items():
+        new = [""] * len(header)
+        new[ci["Comment"]], new[ci["Footprint"]], new[ci["LCSC"]] = key
+        new[ci["Designator"]] = ",".join(refs)
+        if qi is not None:
+            new[qi] = str(len(refs))
+        if key in slots:
+            out[slots[key]] = new
+            prev = slot_old[key]
+            kind = "unchanged" if prev == new else "replaced"
+        else:
+            out.append(new)
+            prev, kind = None, "added"
+        diff.append({"kind": kind, "ref": ",".join(refs), "old": prev, "new": new})
+    return [r for r in out if r is not None], diff
+
+
+def read_csv_rows(path: Path) -> Tuple[List[str], List[List[str]]]:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise ValueError(f"{path.name} is empty")
+    return rows[0], rows[1:]
+
+
+def write_csv_with_backup(path: Path, header: List[str], rows: List[List[str]]) -> bool:
+    """Write like the plugin does (csv, newline='', UTF-8). Copies the old file
+    to <file>.bak first. Returns False (and writes nothing) if unchanged."""
+    path = Path(path)
+    if path.exists():
+        if read_csv_rows(path) == (header, rows):
+            return False
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=",")
+        writer.writerow(header)
+        writer.writerows(rows)
+    return True
+
+
+# ───── Config, presets, paths ─────────────────────────────────────────────
+
+def jlc_output_paths(pro_path: Path) -> Dict[str, Path]:
+    """The board and the plugin's BOM/CPL for a .kicad_pro."""
+    pro_path = Path(pro_path)
+    pcb = pro_path.with_suffix(".kicad_pcb")
+    out_dir = pro_path.parent / "jlcpcb" / "production_files"
+    return {"pcb": pcb, "bom": out_dir / f"BOM-{pcb.stem}.csv",
+            "cpl": out_dir / f"CPL-{pcb.stem}.csv"}
+
+
+def multipart_config_path(pro_path: Path) -> Path:
+    pro_path = Path(pro_path)
+    return pro_path.with_name(pro_path.stem + ".multipart.json")
+
+
+def multipart_config_load(pro_path: Path) -> dict:
+    """The project's config, or an empty one. Raises ValueError if the file
+    is broken or from a newer PartBench."""
+    path = multipart_config_path(pro_path)
+    if not path.exists():
+        return {"version": MULTIPART_CONFIG_VERSION, "parents": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path.name} is not valid JSON: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("parents", []), list):
+        raise ValueError(f"{path.name} is not a multi-part config")
+    if data.get("version", 1) > MULTIPART_CONFIG_VERSION:
+        raise ValueError(f"{path.name} is version {data['version']}; "
+                         f"this PartBench reads version {MULTIPART_CONFIG_VERSION}")
+    data["version"] = MULTIPART_CONFIG_VERSION
+    for parent in data.get("parents", []):
+        parent.setdefault("drop_parent_from_cpl", True)
+        parent["subparts"] = [_subpart_with_defaults(s) for s in parent.get("subparts", [])]
+    data.setdefault("parents", [])
+    return data
+
+
+def multipart_config_save(pro_path: Path, config: dict) -> Path:
+    path = multipart_config_path(pro_path)
+    path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _multipart_presets_file() -> Path:
+    # Read PASSIVES_LIB_DIR at call time so tests can redirect it
+    return PASSIVES_LIB_DIR / "multipart_presets.json"
+
+
+def multipart_presets_all() -> Dict[str, dict]:
+    """Built-in presets, then the user's (a user preset can't hide a built-in)."""
+    presets = dict(MULTIPART_PRESETS)
+    path = _multipart_presets_file()
+    try:
+        user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        user = {}
+    for name, preset in user.items():
+        if name not in presets and isinstance(preset, dict):
+            presets[name] = preset
+    return presets
+
+
+def multipart_preset_save_user(name: str, preset: dict) -> None:
+    if name in MULTIPART_PRESETS:
+        raise ValueError(f"{name!r} is a built-in preset; pick another name")
+    path = _multipart_presets_file()
+    try:
+        user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        user = {}
+    user[name] = preset
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(user, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
