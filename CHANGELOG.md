@@ -12,6 +12,7 @@ Versions before 6.1.0 were numbered inside the script header; see `git log` for 
 - Added unit tests and CI.
 - Added feature tests that drive the real app against a generated practice library (`tests/practice_lib.py`, `tests/gui_harness.py`). Confirmed bugs are tracked as expected failures and in issues #2–#5.
 - The 3D Models, BOM Manager and Passives tabs are marked experimental (#1).
+- **Multi-part CPL** tab (experimental): place one schematic symbol as several parts in the JLCPCB plugin's BOM/CPL, such as the two 100-pin connectors of a Raspberry Pi CM5. Pad-range or offset placement, a built-in CM5 preset and your own presets, a board preview, a CSV diff and `.bak` backups. See `docs/multipart-cpl-spec.md`.
 
 ## 6.1.0 (2026-09-22)
 

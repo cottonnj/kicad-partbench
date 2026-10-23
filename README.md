@@ -20,6 +20,7 @@ Download a part from UltraLibrarian, SnapEDA or SamacSys, drop the ZIP in a fold
   - [Library](#-library): browse, validate and repair the library
   - [3D Models](#-3d-models): find and fix broken model paths
   - [BOM Manager](#-bom-manager): push an Octopart BOM's MPNs into your schematics
+  - [Multi-part CPL](#-multi-part-cpl): place one symbol as several parts (e.g. CM5 connectors) in the JLCPCB BOM/CPL
   - [Passives](#-passives): assign MPN/LCSC to resistors, capacitors and inductors in bulk
   - [Settings and Results](#%EF%B8%8F-settings-and--results)
 - [Standalone repair tools](#standalone-repair-tools)
@@ -135,6 +136,25 @@ Pushes the MPNs from an **Octopart BOM** (`.xlsx` or `.csv`) back into your KiCa
 
 The BOM needs a reference column (`Designator`, `Reference` or `Ref`) and an MPN column (`Matched Part Number`, `MPN` or `Part Number`). `Value`, `Footprint`, `Manufacturer`, `Datasheet` and `Description` columns are used if present.
 
+### 🔌 Multi-part CPL
+
+> ⚠️ **Experimental.** New in 6.1.x. Check the preview and JLC's placement view before ordering. See [#1](https://github.com/cottonnj/kicad-partbench/issues/1).
+
+![Multi-part CPL](docs/screenshots/multipart-cpl.png)
+
+For a schematic symbol that is really several parts on the board. The main case is a Raspberry Pi CM5 carrier: the schematic has one 200-pin `Module1`, but JLCPCB has to place two 100-pin board-to-board connectors. Instead of "ghost" connector footprints placed by hand on top of the module, this tab patches the BOM and CPL that the [JLCPCB plugin](https://github.com/Bouni/kicad-jlcpcb-tools) wrote. Nothing in the KiCad design changes.
+
+1. Run the JLCPCB plugin as usual, then pick the `.kicad_pro`. The tab finds the board and `jlcpcb/production_files/{BOM,CPL}-<board>.csv`.
+2. Pick the parent footprint (the ones with the most pads are listed first) and either **Apply Preset** (built in: **Raspberry Pi CM5**, Amphenol 10164227-1001A1RLF) or **Add Sub-part**. Each sub-part is placed one of two ways:
+   - **pads**: at the centre of a pad range of the parent, such as `101-200` or `1-50,52,EP`.
+   - **offset**: at an X/Y offset from the parent's origin. Type it in, or click the preview to place it.
+
+   Offsets are in the parent footprint's own frame, as in the footprint editor, so they follow the parent when it moves or rotates. **Rotation offset** is added to the parent's rotation.
+3. **Preview** draws the parent's pads coloured by sub-part, with each computed centre, its CPL X/Y/rotation and a pin-1 marker. Any leftover footprint using a sub-part's reference is drawn in red with how far off it is. The table below lists every CSV row that will be removed, added or replaced.
+4. **Patch CSVs** copies each file to `<file>.csv.bak`, then writes the parent's row out and one CPL row per sub-part in. The BOM gets one line per part with all its references and the quantity. Patching again gives the same files. If the plugin rewrites the CSVs after a Preview, Patch refuses until you preview again.
+
+Positions follow the plugin exactly (centre of the pads, relative to the drill/place origin, Y flipped; bottom-side rotations mirrored), so the new rows are consistent with every other row it writes. The settings are saved next to the project as `<project>.multipart.json`, so each revision folder keeps its own. **Save as Preset…** stores a set-up for the next board like it.
+
 ### 🧩 Passives
 
 > ⚠️ **Experimental.** This tab has known bugs and is incomplete. Check its results and back up your files before applying changes. See [#1](https://github.com/cottonnj/kicad-partbench/issues/1).
@@ -174,8 +194,10 @@ Assigns MPN, LCSC and spec fields to resistors, capacitors and inductors from yo
 |---|---|
 | `~/.kicad_personal_importer.json` | Saved settings (folders, options) |
 | `~/.kicad-library-tool/passives.json` | Passives library |
+| `~/.kicad-library-tool/multipart_presets.json` | Your Multi-part CPL presets |
+| `<project>.multipart.json` next to the `.kicad_pro` | Multi-part CPL settings for that project |
 | `<library>/.kicad_personal_import_log.json` | Import skip-list. Clear it from **Tools → View / Reset Import Log…** |
-| `*.bak` next to edited files | Backup made before every write to a symbol file |
+| `*.bak` next to edited files | Backup made before every write to a symbol, schematic or JLCPCB CSV file |
 
 Close KiCad's symbol and footprint editors before applying changes, and keep your library under version control (or at least backed up). PartBench makes `.bak` copies, but it does rewrite your files.
 
@@ -188,7 +210,7 @@ python -m unittest discover -s tests -v     # add `xvfb-run -a` in front on a he
 ruff check .                                # bug-class rules only; see ruff.toml
 ```
 
-- `tests/test_core.py`: the parsing and normalization helpers, with no GUI.
+- `tests/test_core.py`: the parsing and normalization helpers, with no GUI. `tests/fixtures/` holds a trimmed real board (the CM5 module and its connectors) for the Multi-part CPL maths.
 - `tests/test_features_*.py`: feature tests that start the real app against a throwaway **practice library** and click through each tab's buttons, then check what was written to disk. [`tests/practice_lib.py`](tests/practice_lib.py) builds that library (vendor ZIPs in three layouts, duplicate symbols, broken 3D paths, a hierarchical project, Octopart BOMs). [`tests/gui_harness.py`](tests/gui_harness.py) drives the app and records dialogs instead of showing them. The feature tests are skipped when no display is available.
 - Known bugs are tests marked `@unittest.expectedFailure` with a `# BUG:` comment. When you fix one, the test starts passing unexpectedly; remove its decorator.
 

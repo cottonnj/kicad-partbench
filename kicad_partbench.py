@@ -9585,7 +9585,7 @@ def _mp_redraw(self, placements=None, ghosts=None):
         c.create_line(x - r, y, x + r, y, fill=COLORS['text'], width=2)
         c.create_line(x, y - r, x, y + r, fill=COLORS['text'], width=2)
         c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=2)
-        c.create_text(x + r + 4, y + 2, anchor="nw", fill=COLORS['text'], font=("Segoe UI", 9, "bold"),
+        c.create_text(x, y + r + 6, anchor="n", fill=COLORS['text'], font=("Segoe UI", 9, "bold"),
                       text=f"{sub['ref']}  X {p['cpl_x']:.3f}  Y {p['cpl_y']:.3f}  R {p['rotation']:g}")
 
 

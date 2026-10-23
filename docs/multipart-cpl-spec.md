@@ -1,6 +1,7 @@
 # Spec: Multi-part CPL tab ("one symbol, several placed parts")
 
-Status: proposal, not started. Written 2026-10-22 from the VHF-Shark-PCBs session.
+Status: implemented in 6.1.x as an experimental tab (see [the plan](multipart-cpl-plan.md)
+and "Findings" at the end). Written 2026-10-22 from the VHF-Shark-PCBs session.
 
 ## Problem
 
@@ -142,3 +143,36 @@ and anything else is listed explicitly.
    then store it as `rotation_offset` in the config.
 3. Should the tab also read sub-part info from parent footprint properties (for example the
    existing `Field5 = "2x 10164227-1001A1RLF"`) to pre-fill the table?
+
+## Findings (2026-10-23)
+
+- **Plugin conventions** (kicad-jlcpcb-tools `fabrication.py`, KiCad 10 install):
+  - CPL header: `Designator,Val,Package,Mid X,Mid Y,Rotation,Layer`
+  - BOM header: `Comment,Designator,Footprint,LCSC,Quantity`. There is a Quantity column.
+  - Rows are written with `csv`, `newline=""` and UTF-8.
+  - CPL rows are sorted by reference. Numbers are `ToMM` floats (up to 6 decimals),
+    rotation is a float such as `90.0`, and the layer is `top` or `bottom`.
+  - Position is the centre of the merged pad bounding boxes, **NPTH holes included**.
+  - Rotation corrections are added after the bottom-side mirror.
+  - The plugin can also shift positions per footprint pattern. Sub-parts don't get
+    this; they use their own offsets instead.
+- **Pad angles in the board file are absolute.** They already include the footprint
+  angle. The Rev-12 `Module1` SMD pads have no angle while the footprint is at 90°.
+- **Bottom side:** pad coordinates for footprints on B.Cu are stored already flipped,
+  so the same local→board transform works on both sides.
+- **Checked against real boards:** the position code reproduces the plugin's CPL on
+  618 of 623 rows across five boards, including 50 bottom-side parts. The other
+  five rows are explained:
+  - four come from CPLs exported before the board was last edited
+  - one has a plugin position correction
+- **Rev-12 result:** with pads 101–200 → J6 and 1–100 → J7, the computed rows are
+  J6 (33.95, 120.26) and J7 (33.95, 86.26). The hand-placed ghost J6 is exactly in
+  the right place; the ghost J7 is 48.65 mm off.
+- **Q1 (part):** the Amphenol 10164227-1001A1RLF (LCSC C6782225) is used. The
+  G-Switch GT-B0403FSV14-100B1101 (C42376244) has the same listed pins, pitch and
+  current, and is a pin-compatible alternative.
+- **Q2 (rotation):** in the Rev-4 order that JLC accepted, both connectors are at
+  0.0 with Module1 at 90, so the CM5 preset uses `rotation_offset = -90`. That order
+  used the G-Switch part. Each LCSC part has its own JLC footprint, so check the
+  rotation once in JLC's placement preview with the Amphenol part.
+- **Q3 (Field5 pre-fill):** deferred.
