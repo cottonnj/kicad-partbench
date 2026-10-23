@@ -787,8 +787,18 @@ class LibraryBrowserTests(ImportTestBase):
                          ("STM32G431CBU6", "QFN50P700X700X60-49N", "STM32G431CBU6", "QFN50P700X700X60-49N.step", "12"))
         self.assertEqual(rows["TPS62133RGTR"][3], "TPS62133RGTR.stp")
 
+    def test_refresh_after_search_keeps_showing_label(self):
+        self.h.select_tab("library")
+        self.h.pump(5)
+        app = self.h.app
+        app.lib_search_var.set("lm358")
+        app.refresh_library_browser()
+        self.h.pump()
+        self.assertEqual(app.lib_count_label.cget("text"), "Showing: 2/4")
+
     def test_search_filter(self):
         self.h.select_tab("library")
+        self.h.pump(5)  # let the tab-change refresh finish first
         app = self.h.app
         app.lib_search_var.set("lm358")
         self.h.pump()

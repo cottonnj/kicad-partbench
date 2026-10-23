@@ -3946,7 +3946,6 @@ Features bug fixes and UI improvements.
             # Display all
             self.filter_library_browser()
             self.lib_info_var.set(f"✅ Loaded {len(syms)} symbols from {sym_path.name}")
-            self.lib_count_label.config(text=f"Total: {len(syms)}")
             
         except Exception as e:
             self.lib_info_var.set(f"❌ Error: {e}")
