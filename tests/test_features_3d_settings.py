@@ -679,6 +679,7 @@ class SettingsBase(GuiTestCase):
         self.appdata.mkdir(parents=True)
         env = {k: v for k, v in os.environ.items() if k not in ("APPDATA", "LOCALAPPDATA")}
         env["HOME"] = str(self.fake_home)
+        env["USERPROFILE"] = str(self.fake_home)  # Path.home() on Windows
         env["APPDATA"] = str(self.appdata)
         self._envpatch = mock.patch.dict(os.environ, env, clear=True)
         super().setUp()  # the harness isolates env first; this test's env goes on top

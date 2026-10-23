@@ -378,7 +378,7 @@ class TestAssign3DModel(LibraryToolsTestBase):
     def test_absolute_format_writes_full_path(self):
         m = self.model_file()
         paths = self.assign(m, "Absolute path")
-        self.assertEqual(paths, [str(m)])
+        self.assertEqual(paths, [m.as_posix()])  # KiCad paths use forward slashes on every OS
 
     def test_personal_lib_format_for_model_in_3d_step(self):
         m = self.model_file()
