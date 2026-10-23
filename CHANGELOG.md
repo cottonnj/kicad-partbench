@@ -10,6 +10,8 @@ Versions before 6.1.0 were numbered inside the script header; see `git log` for 
 - Read-only dropdowns are readable in the dark theme.
 - The About box shows the correct version.
 - Added unit tests and CI.
+- Added feature tests that drive the real app against a generated practice library (`tests/practice_lib.py`, `tests/gui_harness.py`). Confirmed bugs are tracked as expected failures and in issues #2–#5.
+- The 3D Models, BOM Manager and Passives tabs are marked experimental (#1).
 
 ## 6.1.0 (2026-09-22)
 
