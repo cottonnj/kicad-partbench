@@ -111,6 +111,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import shutil
 import hashlib
@@ -1764,6 +1765,7 @@ class App(tk.Tk):
         tab_library = ttk.Frame(notebook)
         tab_3d = ttk.Frame(notebook)
         tab_bom = ttk.Frame(notebook)
+        tab_multipart = ttk.Frame(notebook)
         tab_passives = ttk.Frame(notebook)
         tab_settings = ttk.Frame(notebook)
         tab_results = ttk.Frame(notebook)
@@ -1773,6 +1775,7 @@ class App(tk.Tk):
         notebook.add(tab_library, text=" 📚 Library ")
         notebook.add(tab_3d, text=" 🎲 3D Models ")
         notebook.add(tab_bom, text=" 📋 BOM Manager ")
+        notebook.add(tab_multipart, text=" 🔌 Multi-part CPL ")
         notebook.add(tab_passives, text=" 🧩 Passives ")
         notebook.add(tab_settings, text=" ⚙️ Settings ")
         notebook.add(tab_results, text=" 📊 Results ")
@@ -1782,6 +1785,7 @@ class App(tk.Tk):
         self._create_library_tab(tab_library)
         self._create_3d_models_tab(tab_3d)
         self._create_bom_manager_tab(tab_bom)
+        self._create_multipart_tab(tab_multipart)
         self._create_passives_tab(tab_passives)
         self._create_settings_tab(tab_settings)
         self._create_results_tab(tab_results)
@@ -8574,6 +8578,1365 @@ App._passives_edit_row                 = _passives_edit_row
 App._passives_open_library_manager     = _passives_open_library_manager
 App._passives_save_all_complete        = _passives_save_all_complete
 App._passives_run_save_queue           = _passives_run_save_queue
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-PART CPL — one schematic symbol, several placed parts
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Runs after the JLCPCB plugin (Bouni's kicad-jlcpcb-tools) has written
+# jlcpcb/production_files/{BOM,CPL}-<board>.csv. For each configured parent
+# footprint (e.g. a CM5 "Module1"), it drops the parent row and adds one row
+# per sub-part (e.g. the two 100-pin B2B connectors J6/J7), placed from the
+# parent's own pads in the .kicad_pcb.
+#
+# Positions follow the plugin's fabrication.py exactly: centre of the merged
+# pad bounding boxes, minus the aux origin, Y negated; rotation is the
+# footprint angle, mirrored (180 - a) on the bottom, plus a correction.
+#
+# Sub-part modes:
+#   pads    centre of the listed pads; xy_offset_mm is a nudge on top
+#   offset  xy_offset_mm from the parent origin, no pads needed
+# Both offsets are in the parent's own frame (like footprint-editor
+# coordinates), so they turn with the parent.
+#
+# Config: <project>.multipart.json next to the .kicad_pro
+# User presets: ~/.kicad-library-tool/multipart_presets.json
+# CSV backup: <file>.csv.bak before any write.
+# ═══════════════════════════════════════════════════════════════════════════
+
+MULTIPART_CONFIG_VERSION = 1
+CM5_PRESET = "Raspberry Pi CM5 (2× 100-pin B2B)"
+
+# Pad ranges match the CM5 datasheet numbering (101-200 is the second
+# connector). expect_local_mm is the measured connector centre in the CM5
+# footprint's frame; it is only a cross-check, the position comes from the pads.
+# Part: Amphenol 10164227-1001A1RLF (G-Switch GT-B0403FSV14-100B1101, C42376244,
+# is a pin-compatible alternative). Rotation is as ordered on M-050 Rev-4
+# (connectors at 0 with the module at 90, with the G-Switch part); check it
+# in JLC's placement preview, since each part has its own JLC footprint.
+MULTIPART_PRESETS: Dict[str, dict] = {
+    CM5_PRESET: {
+        "comment": "10164227-1001A1RLF",
+        "footprint": "CONN-SMD_100P-P0.40_10164227-1001A1RLF",
+        "lcsc": "C6782225",
+        "rotation_offset": -90,
+        "subparts": [
+            {"ref": "J6", "pads": "101-200", "expect_local_mm": [33.5, -21.5]},
+            {"ref": "J7", "pads": "1-100", "expect_local_mm": [-0.5, -21.5]},
+        ],
+    },
+}
+
+_MULTIPART_PRESET_TOLERANCE_MM = 0.1
+_SUBPART_DEFAULTS = {"mode": "pads", "pads": "", "comment": "", "footprint": "", "lcsc": "",
+                     "rotation_offset": 0, "xy_offset_mm": [0, 0]}
+
+# A quoted string (with escapes) or a single paren
+_SEXP_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|[()]')
+_NUM = r'(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)'
+_AT_RE = re.compile(r'\(at\s+' + _NUM + r'\s+' + _NUM + r'(?:\s+' + _NUM + r')?')
+_SIZE_RE = re.compile(r'\(size\s+' + _NUM + r'\s+' + _NUM)
+_XY_RE = re.compile(r'\((start|end)\s+' + _NUM + r'\s+' + _NUM)
+
+
+def _sexp_unquote(s: str) -> str:
+    return re.sub(r'\\(.)', r'\1', s[1:-1])
+
+
+def _sexp_block_end(text: str, start: int) -> int:
+    """Index of the ')' closing the '(' at start, skipping quoted strings
+    (unlike _find_matching_paren). Returns -1 if unbalanced."""
+    depth = 0
+    for m in _SEXP_TOKEN_RE.finditer(text, start):
+        tok = m.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth == 0:
+                return m.start()
+    return -1
+
+
+def _sexp_children(block: str, head: str) -> List[str]:
+    """Direct child blocks of block (which starts with '(') named head."""
+    out = []
+    head_re = re.compile(r'\(' + re.escape(head) + r'[\s)]')
+    depth = 0
+    pos = block.find("(")
+    while True:
+        m = _SEXP_TOKEN_RE.search(block, pos)
+        if not m:
+            break
+        tok = m.group(0)
+        if tok == "(":
+            if depth == 1 and head_re.match(block, m.start()):
+                end = _sexp_block_end(block, m.start())
+                if end < 0:
+                    raise ValueError(f"unbalanced ({head} ...) block")
+                out.append(block[m.start():end + 1])
+                pos = end + 1
+                continue
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+        pos = m.end()
+    return out
+
+
+def parse_pad_spec(spec: str) -> Set[str]:
+    """'1-100' / '1-50,52,EP' -> set of pad numbers. Ranges are numeric only."""
+    pads: Set[str] = set()
+    if not spec.strip():
+        return pads
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"empty entry in pad list {spec!r}")
+        if "-" in part:
+            bits = part.split("-")
+            if len(bits) != 2 or not all(b.strip().isdigit() for b in bits):
+                raise ValueError(f"bad pad range {part!r} (ranges are numeric, e.g. 1-100)")
+            lo, hi = int(bits[0]), int(bits[1])
+            if lo > hi:
+                raise ValueError(f"reversed pad range {part!r}")
+            pads.update(str(n) for n in range(lo, hi + 1))
+        else:
+            pads.add(part)
+    return pads
+
+
+def _parse_pcb_footprint_block(block: str) -> dict:
+    lib = re.match(r'\(footprint\s+("(?:\\.|[^"\\])*")', block)
+    at = None
+    for child in _sexp_children(block, "at"):
+        at = _AT_RE.match(child)
+        break
+    layer = ""
+    for child in _sexp_children(block, "layer"):
+        m = re.match(r'\(layer\s+("(?:\\.|[^"\\])*")', child)
+        layer = _sexp_unquote(m.group(1)) if m else ""
+        break
+    ref = ""
+    for child in _sexp_children(block, "property"):
+        m = re.match(r'\(property\s+"Reference"\s+("(?:\\.|[^"\\])*")', child)
+        if m:
+            ref = _sexp_unquote(m.group(1))
+            break
+    if not ref:  # KiCad 5 style
+        for child in _sexp_children(block, "fp_text"):
+            m = re.match(r'\(fp_text\s+reference\s+("(?:\\.|[^"\\])*"|\S+)', child)
+            if m:
+                ref = _sexp_unquote(m.group(1)) if m.group(1).startswith('"') else m.group(1)
+                break
+    pads = []
+    for child in _sexp_children(block, "pad"):
+        m = re.match(r'\(pad\s+("(?:\\.|[^"\\])*"|\S+)\s+(\S+)\s+(\S+)', child)
+        pat, size = _AT_RE.search(child), _SIZE_RE.search(child)
+        if not (m and pat and size):
+            continue
+        num = m.group(1)
+        pads.append({
+            "number": _sexp_unquote(num) if num.startswith('"') else num,
+            "type": m.group(2), "shape": m.group(3),
+            "x": float(pat.group(1)), "y": float(pat.group(2)),
+            # Pad angles in the file are absolute (they include the footprint's)
+            "angle": float(pat.group(3) or 0),
+            "w": float(size.group(1)), "h": float(size.group(2)),
+        })
+    lines = []  # courtyard outline, local coordinates
+    for kind in ("fp_line", "fp_rect"):
+        for child in _sexp_children(block, kind):
+            if "CrtYd" not in child:
+                continue
+            pts = {k: (float(x), float(y)) for k, x, y in _XY_RE.findall(child)}
+            if "start" not in pts or "end" not in pts:
+                continue
+            (x1, y1), (x2, y2) = pts["start"], pts["end"]
+            if kind == "fp_line":
+                lines.append(((x1, y1), (x2, y2)))
+            else:
+                lines += [((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)),
+                          ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))]
+    return {
+        "ref": ref,
+        "lib_id": _sexp_unquote(lib.group(1)) if lib else "",
+        "x": float(at.group(1)) if at else 0.0,
+        "y": float(at.group(2)) if at else 0.0,
+        "angle": float(at.group(3) or 0) if at else 0.0,
+        "layer": layer,
+        "pads": pads,
+        "lines": lines,
+    }
+
+
+def parse_pcb_aux_origin(pcb_text: str) -> Tuple[float, float]:
+    """(setup (aux_axis_origin X Y)), default (0, 0)."""
+    m = re.search(r'\(aux_axis_origin\s+' + _NUM + r'\s+' + _NUM, pcb_text)
+    return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+
+
+def _pcb_footprints(pcb_text: str) -> List[dict]:
+    aux = parse_pcb_aux_origin(pcb_text)
+    out = []
+    for block in _sexp_children(pcb_text, "footprint"):
+        fp = _parse_pcb_footprint_block(block)
+        fp["aux"] = aux
+        out.append(fp)
+    return out
+
+
+def list_pcb_footprints(pcb_text: str) -> List[dict]:
+    """[{ref, lib_id, layer, pad_count}], most pads first."""
+    fps = [{"ref": f["ref"], "lib_id": f["lib_id"], "layer": f["layer"],
+            "pad_count": len(f["pads"])} for f in _pcb_footprints(pcb_text) if f["ref"]]
+    return sorted(fps, key=lambda f: (-f["pad_count"], _ref_sort_key(f["ref"])))
+
+
+def parse_pcb_footprint(pcb_text: str, ref: str) -> dict:
+    """Position, angle, layer, pads, courtyard lines and aux origin of one
+    footprint. Raises KeyError if ref is not on the board."""
+    for fp in _pcb_footprints(pcb_text):
+        if fp["ref"] == ref:
+            return fp
+    raise KeyError(f"{ref} is not on the board")
+
+
+def _fp_to_board(fp: dict, lx: float, ly: float) -> Tuple[float, float]:
+    """Footprint-local -> board (KiCad y-down, angle counter-clockwise on screen)."""
+    a = math.radians(fp["angle"])
+    c, s = math.cos(a), math.sin(a)
+    return fp["x"] + lx * c + ly * s, fp["y"] - lx * s + ly * c
+
+
+def _board_to_fp(fp: dict, bx: float, by: float) -> Tuple[float, float]:
+    a = math.radians(fp["angle"])
+    c, s = math.cos(a), math.sin(a)
+    dx, dy = bx - fp["x"], by - fp["y"]
+    return dx * c - dy * s, dx * s + dy * c
+
+
+def _pad_board_box(fp: dict, pad: dict) -> Tuple[float, float, float, float]:
+    cx, cy = _fp_to_board(fp, pad["x"], pad["y"])
+    if pad["shape"] == "circle":
+        hx = hy = pad["w"] / 2
+    else:  # rect/roundrect/oval/custom: box of the rotated size rectangle
+        a = math.radians(pad["angle"])
+        c, s = abs(math.cos(a)), abs(math.sin(a))
+        hx = pad["w"] / 2 * c + pad["h"] / 2 * s
+        hy = pad["w"] / 2 * s + pad["h"] / 2 * c
+    return cx - hx, cy - hy, cx + hx, cy + hy
+
+
+def footprint_pad_center(fp: dict, pads: Optional[List[dict]] = None) -> Tuple[float, float]:
+    """Board centre of the merged pad boxes (the plugin's get_position).
+    Falls back to the footprint origin when there are no pads."""
+    pads = fp["pads"] if pads is None else pads
+    if not pads:
+        return fp["x"], fp["y"]
+    boxes = [_pad_board_box(fp, p) for p in pads]
+    return ((min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2,
+            (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2)
+
+
+def jlc_rotation(fp: dict, offset: float = 0) -> float:
+    rot = fp["angle"] % 360
+    if not fp["layer"].startswith("F."):
+        rot = (180 - rot) % 360
+    return float((rot + offset) % 360) + 0.0
+
+
+def _subpart_with_defaults(sub: dict) -> dict:
+    out = dict(_SUBPART_DEFAULTS)
+    out.update(sub)
+    out["xy_offset_mm"] = list(out.get("xy_offset_mm") or [0, 0])
+    return out
+
+
+def subpart_placement(fp: dict, subpart: dict) -> dict:
+    """Board and CPL position + rotation for one sub-part of parent fp."""
+    sub = _subpart_with_defaults(subpart)
+    warnings = []
+    dx, dy = (float(v) for v in sub["xy_offset_mm"])
+    if sub["mode"] == "offset":
+        bx, by = _fp_to_board(fp, dx, dy)
+        pad_center = None
+    elif sub["mode"] == "pads":
+        wanted = parse_pad_spec(sub["pads"])
+        pads = [p for p in fp["pads"] if p["number"] in wanted]
+        if not pads:
+            raise ValueError(f"{sub['ref']}: none of pads {sub['pads']!r} are on {fp['ref']}")
+        missing = wanted - {p["number"] for p in pads}
+        if missing:
+            shown = ", ".join(sorted(missing, key=_ref_sort_key)[:8])
+            more = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+            warnings.append(f"{sub['ref']}: {fp['ref']} has no pad {shown}{more}")
+        pad_center = footprint_pad_center(fp, pads)
+        lx, ly = _board_to_fp(fp, *pad_center)
+        bx, by = _fp_to_board(fp, lx + dx, ly + dy)
+    else:
+        raise ValueError(f"{sub['ref']}: unknown mode {sub['mode']!r}")
+    ax, ay = fp["aux"]
+    return {
+        "ref": sub["ref"], "parent": fp["ref"],
+        "board_x": bx, "board_y": by,
+        "cpl_x": bx - ax, "cpl_y": -(by - ay),
+        "rotation": jlc_rotation(fp, float(sub["rotation_offset"])),
+        "layer": "top" if fp["layer"].startswith("F.") else "bottom",
+        "local": _board_to_fp(fp, bx, by),
+        "pad_center_local": _board_to_fp(fp, *pad_center) if pad_center else None,
+        "warnings": warnings,
+    }
+
+
+def apply_preset(preset: dict) -> List[dict]:
+    """Sub-part rows for the config, preset-level fields filled into each."""
+    shared = {k: preset[k] for k in ("comment", "footprint", "lcsc", "rotation_offset")
+              if k in preset}
+    return [_subpart_with_defaults({**shared, **sub}) for sub in preset.get("subparts", [])]
+
+
+def check_preset(placement: dict, subpart: dict) -> Optional[str]:
+    """Warning when the pad centre is not where the preset measured it."""
+    expect = subpart.get("expect_local_mm")
+    got = placement.get("pad_center_local")
+    if not expect or got is None:
+        return None
+    dist = math.hypot(got[0] - expect[0], got[1] - expect[1])
+    if dist <= _MULTIPART_PRESET_TOLERANCE_MM:
+        return None
+    return (f"{subpart['ref']}: pad centre is {dist:.2f} mm from where the preset expects it "
+            f"(got {got[0]:.2f}, {got[1]:.2f}; expected {expect[0]:.2f}, {expect[1]:.2f}). "
+            f"Different footprint origin, or the pad ranges are swapped?")
+
+
+def multipart_placements(pcb_text: str, config: dict) -> Tuple[Dict[str, dict], List[str]]:
+    """{sub-part ref: placement} for every parent in config, plus warnings."""
+    return _multipart_placements_fps({f["ref"]: f for f in _pcb_footprints(pcb_text)}, config)
+
+
+def _multipart_placements_fps(fps: Dict[str, dict],
+                              config: dict) -> Tuple[Dict[str, dict], List[str]]:
+    placements, warnings = {}, []
+    for parent in config.get("parents", []):
+        fp = fps.get(parent["ref"])
+        if fp is None:
+            raise KeyError(f"{parent['ref']} is not on the board")
+        for sub in parent.get("subparts", []):
+            p = subpart_placement(fp, sub)
+            placements[p["ref"]] = p
+            warnings += p["warnings"]
+            w = check_preset(p, sub)
+            if w:
+                warnings.append(w)
+    return placements, warnings
+
+
+def find_ghosts(pcb_text: str, config: dict, placements: Dict[str, dict]) -> List[dict]:
+    """Footprints on the board that use a sub-part's ref, and how far they are
+    from the computed position."""
+    return _find_ghosts_fps({f["ref"]: f for f in _pcb_footprints(pcb_text)}, placements)
+
+
+def _find_ghosts_fps(fps: Dict[str, dict], placements: Dict[str, dict]) -> List[dict]:
+    out = []
+    for fp in fps.values():
+        p = placements.get(fp["ref"])
+        if p is None:
+            continue
+        gx, gy = footprint_pad_center(fp)
+        out.append({"ref": fp["ref"], "board_x": gx, "board_y": gy,
+                    "rotation": jlc_rotation(fp),
+                    "distance_mm": math.hypot(gx - p["board_x"], gy - p["board_y"])})
+    return out
+
+
+# ───── CSV patching ───────────────────────────────────────────────────────
+
+def _cpl_num(v: float) -> str:
+    return str(round(v, 6) + 0.0)
+
+
+def _remove_refs(config: dict) -> Tuple[Set[str], List[dict]]:
+    """(refs whose existing rows go away, all sub-parts in order)."""
+    refs, subs = set(), []
+    for parent in config.get("parents", []):
+        if parent.get("drop_parent_from_cpl", True):
+            refs.add(parent["ref"])
+        for sub in parent.get("subparts", []):
+            sub = _subpart_with_defaults(sub)
+            refs.add(sub["ref"])
+            subs.append(sub)
+    return refs, subs
+
+
+def _col(header: List[str], name: str) -> int:
+    try:
+        return header.index(name)
+    except ValueError:
+        raise ValueError(f"CSV has no {name!r} column (header: {', '.join(header)})")
+
+
+def patch_cpl(header: List[str], rows: List[List[str]], config: dict,
+              placements: Dict[str, dict]) -> Tuple[List[List[str]], List[dict]]:
+    """Drop parent rows, add or replace one row per sub-part. Other rows keep
+    their order; new rows go where the plugin's sort-by-reference puts them.
+    Returns (rows, diff) with diff entries {kind, ref, old, new}."""
+    ci = {n: _col(header, n) for n in ("Designator", "Val", "Package", "Mid X", "Mid Y",
+                                       "Rotation", "Layer")}
+    drop, subs = _remove_refs(config)
+    old = {r[ci["Designator"]]: r for r in rows if r and r[ci["Designator"]] in drop}
+    kept = [r for r in rows if not (r and r[ci["Designator"]] in drop)]
+    diff = []
+    for sub in subs:
+        p = placements[sub["ref"]]
+        new = [""] * len(header)
+        for name, value in (("Designator", sub["ref"]), ("Val", sub["comment"]),
+                            ("Package", sub["footprint"]), ("Mid X", _cpl_num(p["cpl_x"])),
+                            ("Mid Y", _cpl_num(p["cpl_y"])), ("Rotation", str(p["rotation"])),
+                            ("Layer", p["layer"])):
+            new[ci[name]] = value
+        at = next((i for i, r in enumerate(kept) if r and r[ci["Designator"]] > sub["ref"]),
+                  len(kept))
+        kept.insert(at, new)
+        prev = old.pop(sub["ref"], None)
+        kind = "added" if prev is None else ("unchanged" if prev == new else "replaced")
+        diff.append({"kind": kind, "ref": sub["ref"], "old": prev, "new": new})
+    for ref, prev in old.items():
+        diff.append({"kind": "removed", "ref": ref, "old": prev, "new": None})
+    return kept, diff
+
+
+def patch_bom(header: List[str], rows: List[List[str]],
+              config: dict) -> Tuple[List[List[str]], List[dict]]:
+    """Take sub-part and parent refs out of every BOM row (dropping rows left
+    empty), then add one row per (comment, footprint, LCSC) group of
+    sub-parts, in the slot of the first row that held any of its refs."""
+    ci = {n: _col(header, n) for n in ("Comment", "Designator", "Footprint", "LCSC")}
+    qi = header.index("Quantity") if "Quantity" in header else None
+    drop, subs = _remove_refs(config)
+    groups: Dict[Tuple[str, str, str], List[str]] = {}
+    for sub in subs:
+        groups.setdefault((sub["comment"], sub["footprint"], sub["lcsc"]), []).append(sub["ref"])
+    group_of = {ref: key for key, refs in groups.items() for ref in refs}
+
+    out: List[Optional[List[str]]] = []
+    slots: Dict[Tuple[str, str, str], int] = {}
+    slot_old: Dict[Tuple[str, str, str], List[str]] = {}
+    diff = []
+    for r in rows:
+        refs = [x.strip() for x in r[ci["Designator"]].split(",") if x.strip()] if r else []
+        hit = [x for x in refs if x in drop]
+        if not hit:
+            out.append(r)
+            continue
+        for ref in hit:
+            key = group_of.get(ref)
+            if key and key not in slots:
+                slots[key] = len(out)
+                slot_old[key] = r
+                out.append(None)  # filled below
+        left = [x for x in refs if x not in drop]
+        if left:
+            new = list(r)
+            new[ci["Designator"]] = ",".join(left)
+            if qi is not None:
+                new[qi] = str(len(left))
+            out.append(new)
+            diff.append({"kind": "changed", "ref": ",".join(hit), "old": r, "new": new})
+        elif not any(group_of.get(x) and slot_old.get(group_of[x]) is r for x in hit):
+            diff.append({"kind": "removed", "ref": ",".join(hit), "old": r, "new": None})
+    for key, refs in groups.items():
+        new = [""] * len(header)
+        new[ci["Comment"]], new[ci["Footprint"]], new[ci["LCSC"]] = key
+        new[ci["Designator"]] = ",".join(refs)
+        if qi is not None:
+            new[qi] = str(len(refs))
+        if key in slots:
+            out[slots[key]] = new
+            prev = slot_old[key]
+            kind = "unchanged" if prev == new else "replaced"
+        else:
+            out.append(new)
+            prev, kind = None, "added"
+        diff.append({"kind": kind, "ref": ",".join(refs), "old": prev, "new": new})
+    return [r for r in out if r is not None], diff
+
+
+def read_csv_rows(path: Path) -> Tuple[List[str], List[List[str]]]:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise ValueError(f"{path.name} is empty")
+    return rows[0], rows[1:]
+
+
+def write_csv_with_backup(path: Path, header: List[str], rows: List[List[str]]) -> bool:
+    """Write like the plugin does (csv, newline='', UTF-8). Copies the old file
+    to <file>.bak first. Returns False (and writes nothing) if unchanged."""
+    path = Path(path)
+    if path.exists():
+        if read_csv_rows(path) == (header, rows):
+            return False
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=",")
+        writer.writerow(header)
+        writer.writerows(rows)
+    return True
+
+
+# ───── Config, presets, paths ─────────────────────────────────────────────
+
+def jlc_output_paths(pro_path: Path) -> Dict[str, Path]:
+    """The board and the plugin's BOM/CPL for a .kicad_pro."""
+    pro_path = Path(pro_path)
+    pcb = pro_path.with_suffix(".kicad_pcb")
+    out_dir = pro_path.parent / "jlcpcb" / "production_files"
+    return {"pcb": pcb, "bom": out_dir / f"BOM-{pcb.stem}.csv",
+            "cpl": out_dir / f"CPL-{pcb.stem}.csv"}
+
+
+def multipart_config_path(pro_path: Path) -> Path:
+    pro_path = Path(pro_path)
+    return pro_path.with_name(pro_path.stem + ".multipart.json")
+
+
+def multipart_config_load(pro_path: Path) -> dict:
+    """The project's config, or an empty one. Raises ValueError if the file
+    is broken or from a newer PartBench."""
+    path = multipart_config_path(pro_path)
+    if not path.exists():
+        return {"version": MULTIPART_CONFIG_VERSION, "parents": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path.name} is not valid JSON: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("parents", []), list):
+        raise ValueError(f"{path.name} is not a multi-part config")
+    if data.get("version", 1) > MULTIPART_CONFIG_VERSION:
+        raise ValueError(f"{path.name} is version {data['version']}; "
+                         f"this PartBench reads version {MULTIPART_CONFIG_VERSION}")
+    data["version"] = MULTIPART_CONFIG_VERSION
+    for parent in data.get("parents", []):
+        parent.setdefault("drop_parent_from_cpl", True)
+        parent["subparts"] = [_subpart_with_defaults(s) for s in parent.get("subparts", [])]
+    data.setdefault("parents", [])
+    return data
+
+
+def multipart_config_save(pro_path: Path, config: dict) -> Path:
+    path = multipart_config_path(pro_path)
+    path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _multipart_presets_file() -> Path:
+    # Read PASSIVES_LIB_DIR at call time so tests can redirect it
+    return PASSIVES_LIB_DIR / "multipart_presets.json"
+
+
+def multipart_presets_all() -> Dict[str, dict]:
+    """Built-in presets, then the user's (a user preset can't hide a built-in)."""
+    presets = dict(MULTIPART_PRESETS)
+    path = _multipart_presets_file()
+    try:
+        user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        user = {}
+    for name, preset in user.items():
+        if name not in presets and isinstance(preset, dict):
+            presets[name] = preset
+    return presets
+
+
+def multipart_preset_save_user(name: str, preset: dict) -> None:
+    if name in MULTIPART_PRESETS:
+        raise ValueError(f"{name!r} is a built-in preset; pick another name")
+    path = _multipart_presets_file()
+    try:
+        user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        user = {}
+    user[name] = preset
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(user, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+# ───── Tab UI ─────────────────────────────────────────────────────────────
+
+_MP_GROUP_COLORS = ["#1f6feb", "#3fb950", "#d29922", "#a371f7", "#db61a2", "#39c5cf"]
+_MP_SUB_COLS = ("ref", "mode", "pads", "comment", "footprint", "lcsc", "rot", "offset", "cpl")
+
+
+def _create_multipart_tab(self, parent):
+    """Create the Multi-part CPL tab: place one symbol's sub-parts in the JLC CPL/BOM."""
+    parent.grid_columnconfigure(0, weight=1)
+    parent.grid_rowconfigure(1, weight=1)
+
+    # State
+    self.mp_project = tk.StringVar()
+    self.mp_status = tk.StringVar(
+        value="Pick a .kicad_pro. Run the JLCPCB plugin first so the BOM/CPL exist.")
+    self.mp_parent_var = tk.StringVar()
+    self.mp_preset_var = tk.StringVar()
+    self.mp_drop_parent = tk.BooleanVar(value=True)
+    self.mp_warn_var = tk.StringVar()
+    self.mp_config = {"version": MULTIPART_CONFIG_VERSION, "parents": []}
+    self.mp_fps = {}            # parsed board: ref -> footprint
+    self.mp_paths = {}          # pcb / bom / cpl
+    self.mp_parent_labels = {}  # combobox label -> ref
+    self.mp_preview = None      # result of the last Preview, needed to Patch
+    self._mp_edit = None        # open sub-part dialog
+    self._mp_view = None        # canvas transform
+
+    # ── Section 1: project ──
+    file_frame = ttk.Labelframe(parent, text="1. Project", padding=12)
+    file_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+    file_frame.grid_columnconfigure(1, weight=1)
+    ttk.Label(file_frame, text="KiCad Project:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+    ttk.Entry(file_frame, textvariable=self.mp_project, state="readonly").grid(
+        row=0, column=1, sticky="ew", padx=4, pady=4)
+    ttk.Button(file_frame, text="📁 Browse", command=self._mp_browse_project).grid(
+        row=0, column=2, padx=4, pady=4)
+    ttk.Button(file_frame, text="🔄 Reload", command=self._mp_reload).grid(
+        row=0, column=3, padx=4, pady=4)
+    ttk.Label(file_frame, textvariable=self.mp_status, foreground=COLORS['text_muted']).grid(
+        row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    body = ttk.Frame(parent)
+    body.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
+    # uniform: split by weight, not by how wide the table asks to be
+    body.grid_columnconfigure(0, weight=2, uniform="mp")
+    body.grid_columnconfigure(1, weight=3, uniform="mp")
+    body.grid_rowconfigure(0, weight=1)
+
+    # ── Left: parent, preset, sub-parts ──
+    left = ttk.Labelframe(body, text="2. Parent and Sub-parts", padding=10)
+    left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    left.grid_columnconfigure(1, weight=1)
+    left.grid_rowconfigure(5, weight=1)
+
+    ttk.Label(left, text="Parent footprint:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+    self.mp_parent_combo = ttk.Combobox(left, textvariable=self.mp_parent_var, state="readonly")
+    self.mp_parent_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
+    self.mp_parent_combo.bind("<<ComboboxSelected>>", lambda e: self._mp_on_parent_change())
+    ttk.Checkbutton(left, text="Drop the parent's own CPL/BOM row",
+                    variable=self.mp_drop_parent, command=self._mp_on_drop_toggle).grid(
+        row=1, column=1, columnspan=2, sticky="w", pady=3)
+
+    ttk.Label(left, text="Preset:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
+    self.mp_preset_combo = ttk.Combobox(left, textvariable=self.mp_preset_var, state="readonly")
+    self.mp_preset_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
+    preset_btns = ttk.Frame(left)
+    preset_btns.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 3))
+    ttk.Button(preset_btns, text="Apply Preset", command=self._mp_apply_preset).pack(side="left", padx=2)
+    ttk.Button(preset_btns, text="Save as Preset…", command=self._mp_save_preset).pack(side="left", padx=2)
+    self._mp_refresh_presets()
+
+    ttk.Label(left, text="pads: centre of the listed pads (offset nudges it).   "
+                         "offset: X/Y from the parent origin; click the preview to place.   "
+                         "Offsets are in the parent's own frame, like the footprint editor.",
+              foreground=COLORS['text_muted'], font=("Segoe UI", 8),
+              wraplength=520, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 4))
+
+    tree_frame = ttk.Frame(left)
+    tree_frame.grid(row=5, column=0, columnspan=3, sticky="nsew")
+    tree_frame.grid_columnconfigure(0, weight=1)
+    tree_frame.grid_rowconfigure(0, weight=1)
+    self.mp_sub_tree = ttk.Treeview(tree_frame, columns=_MP_SUB_COLS, show="headings",
+                                    height=8, selectmode="browse")
+    self.mp_sub_tree.grid(row=0, column=0, sticky="nsew")
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.mp_sub_tree.yview)
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.mp_sub_tree.xview)
+    hsb.grid(row=1, column=0, sticky="ew")
+    self.mp_sub_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    for col, text, width in (("ref", "Ref", 50), ("mode", "Mode", 55), ("pads", "Pads", 70),
+                             ("comment", "Comment", 140), ("footprint", "Footprint", 140),
+                             ("lcsc", "LCSC", 80), ("rot", "Rot +", 45), ("offset", "Offset", 75),
+                             ("cpl", "CPL X / Y / Rot", 140)):
+        self.mp_sub_tree.heading(col, text=text)
+        self.mp_sub_tree.column(col, width=width, anchor="w",
+                                stretch=col in ("comment", "footprint", "cpl"))
+    self.mp_sub_tree.bind("<Double-Button-1>", lambda e: self._mp_edit_subpart())
+    self.mp_sub_tree.bind("<<TreeviewSelect>>", lambda e: self._mp_redraw())
+
+    sub_btns = ttk.Frame(left)
+    sub_btns.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+    ttk.Button(sub_btns, text="➕ Add Sub-part", command=self._mp_add_subpart).pack(side="left", padx=2)
+    ttk.Button(sub_btns, text="Edit…", command=self._mp_edit_subpart).pack(side="left", padx=2)
+    ttk.Button(sub_btns, text="Remove", command=self._mp_remove_subpart).pack(side="left", padx=2)
+
+    ttk.Label(left, textvariable=self.mp_warn_var, foreground=COLORS['warning'],
+              wraplength=520, justify="left").grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    # ── Right: preview canvas + diff ──
+    right = ttk.Frame(body)
+    right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+    right.grid_columnconfigure(0, weight=1)
+    right.grid_rowconfigure(0, weight=3)
+    right.grid_rowconfigure(1, weight=2)
+
+    canvas_frame = ttk.Labelframe(right, text="3. Preview (board view, as in the PCB editor)", padding=6)
+    canvas_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+    canvas_frame.grid_columnconfigure(0, weight=1)
+    canvas_frame.grid_rowconfigure(0, weight=1)
+    self.mp_canvas = tk.Canvas(canvas_frame, background=COLORS['panel'], highlightthickness=0,
+                               width=600, height=320)
+    self.mp_canvas.grid(row=0, column=0, sticky="nsew")
+    self.mp_canvas.bind("<Configure>", lambda e: self._mp_redraw())
+    self.mp_canvas.bind("<Button-1>", self._mp_canvas_click)
+
+    diff_frame = ttk.Labelframe(right, text="4. Changes to the CSVs", padding=6)
+    diff_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+    diff_frame.grid_columnconfigure(0, weight=1)
+    diff_frame.grid_rowconfigure(0, weight=1)
+    self.mp_diff_tree = ttk.Treeview(diff_frame, columns=("file", "change", "ref", "before", "after"),
+                                     show="headings", height=6)
+    self.mp_diff_tree.grid(row=0, column=0, sticky="nsew")
+    dsb = ttk.Scrollbar(diff_frame, orient="vertical", command=self.mp_diff_tree.yview)
+    dsb.grid(row=0, column=1, sticky="ns")
+    self.mp_diff_tree.configure(yscrollcommand=dsb.set)
+    for col, text, width in (("file", "File", 45), ("change", "Change", 90), ("ref", "Ref", 70),
+                             ("before", "Before", 260), ("after", "After", 260)):
+        self.mp_diff_tree.heading(col, text=text)
+        self.mp_diff_tree.column(col, width=width, anchor="w", stretch=col in ("before", "after"))
+    self.mp_diff_tree.tag_configure("removed", foreground=COLORS['error'])
+    self.mp_diff_tree.tag_configure("added", foreground=COLORS['success'])
+    self.mp_diff_tree.tag_configure("replaced", foreground=COLORS['warning'])
+    self.mp_diff_tree.tag_configure("changed", foreground=COLORS['warning'])
+    self.mp_diff_tree.tag_configure("unchanged", foreground=COLORS['text_muted'])
+
+    # ── Actions ──
+    actions = ttk.Frame(parent)
+    actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+    ttk.Button(actions, text="👁 Preview", command=self._mp_run_preview,
+               style="Accent.TButton").pack(side="left", padx=4)
+    self.mp_patch_btn = ttk.Button(actions, text="✏️ Patch CSVs", command=self._mp_patch,
+                                   state="disabled")
+    self.mp_patch_btn.pack(side="left", padx=4)
+    ttk.Button(actions, text="💾 Save Config", command=self._mp_save_config).pack(side="left", padx=4)
+    ttk.Label(actions, text="Patch writes <file>.csv.bak first, and is safe to run again.",
+              foreground=COLORS['text_muted']).pack(side="left", padx=12)
+
+
+# ───── Tab actions ────────────────────────────────────────────────────────
+
+def _mp_browse_project(self):
+    fname = filedialog.askopenfilename(
+        title="Select KiCad Project",
+        filetypes=[("KiCad Project", "*.kicad_pro"), ("All Files", "*.*")])
+    if fname:
+        self._mp_load_project(Path(fname))
+
+
+def _mp_reload(self):
+    if self.mp_project.get():
+        self._mp_load_project(Path(self.mp_project.get()), keep_config=True)
+
+
+def _mp_load_project(self, pro: Path, keep_config: bool = False):
+    """Parse the board, find the plugin's CSVs and load the project's config."""
+    pro = Path(pro)
+    paths = jlc_output_paths(pro)
+    if not paths["pcb"].exists():
+        messagebox.showerror("No Board", f"Can't find the board next to the project:\n{paths['pcb']}")
+        return
+    try:
+        fps = {f["ref"]: f for f in _pcb_footprints(paths["pcb"].read_text(encoding="utf-8")) if f["ref"]}
+    except (OSError, ValueError) as e:
+        messagebox.showerror("Parse Error", f"Failed to read the board:\n{e}")
+        return
+    if not keep_config:
+        try:
+            self.mp_config = multipart_config_load(pro)
+        except ValueError as e:
+            messagebox.showerror("Config Error", f"{e}\n\nStarting with an empty config.")
+            self.mp_config = {"version": MULTIPART_CONFIG_VERSION, "parents": []}
+    self.mp_project.set(str(pro))
+    self.mp_paths, self.mp_fps = paths, fps
+
+    def mark(key):
+        return ("✓ " if paths[key].exists() else "✗ ") + paths[key].name
+    cfg = multipart_config_path(pro)
+    self.mp_status.set(f"{mark('pcb')}   ·   {mark('cpl')}   ·   {mark('bom')}   ·   "
+                       f"config: {cfg.name if cfg.exists() else 'new'}")
+
+    by_pads = sorted(fps.values(), key=lambda f: (-len(f["pads"]), _ref_sort_key(f["ref"])))
+    self.mp_parent_labels = {f"{f['ref']} — {len(f['pads'])} pads · {f['lib_id']}": f["ref"]
+                             for f in by_pads}
+    self.mp_parent_combo["values"] = list(self.mp_parent_labels)
+    configured = [p["ref"] for p in self.mp_config["parents"] if p["ref"] in fps]
+    first = configured[0] if configured else (by_pads[0]["ref"] if by_pads else "")
+    self._mp_select_parent(first)
+
+
+def _mp_select_parent(self, ref: str):
+    label = next((lbl for lbl, r in self.mp_parent_labels.items() if r == ref), "")
+    self.mp_parent_var.set(label)
+    self._mp_on_parent_change()
+
+
+def _mp_current_ref(self) -> str:
+    return self.mp_parent_labels.get(self.mp_parent_var.get(), "")
+
+
+def _mp_parent_entry(self, create: bool = False) -> Optional[dict]:
+    ref = self._mp_current_ref()
+    if not ref:
+        return None
+    for p in self.mp_config["parents"]:
+        if p["ref"] == ref:
+            return p
+    if not create:
+        return None
+    entry = {"ref": ref, "drop_parent_from_cpl": self.mp_drop_parent.get(), "subparts": []}
+    self.mp_config["parents"].append(entry)
+    return entry
+
+
+def _mp_on_parent_change(self):
+    entry = self._mp_parent_entry()
+    self.mp_drop_parent.set(entry.get("drop_parent_from_cpl", True) if entry else True)
+    if entry and entry.get("preset") in multipart_presets_all():
+        self.mp_preset_var.set(entry["preset"])
+    self._mp_changed()
+
+
+def _mp_on_drop_toggle(self):
+    entry = self._mp_parent_entry(create=True)
+    if entry:
+        entry["drop_parent_from_cpl"] = self.mp_drop_parent.get()
+    self._mp_changed()
+
+
+def _mp_refresh_presets(self):
+    names = list(multipart_presets_all())
+    self.mp_preset_combo["values"] = names
+    if self.mp_preset_var.get() not in names:
+        self.mp_preset_var.set(names[0] if names else "")
+
+
+def _mp_effective_config(self) -> dict:
+    """The config without parents that have no sub-parts (or aren't on the board)."""
+    parents = [p for p in self.mp_config["parents"] if p.get("subparts") and p["ref"] in self.mp_fps]
+    return {"version": MULTIPART_CONFIG_VERSION, "parents": parents}
+
+
+def _mp_compute(self):
+    """(placements, warnings, ghosts) for the current config; errors become warnings."""
+    try:
+        placements, warnings = _multipart_placements_fps(self.mp_fps, self._mp_effective_config())
+    except (ValueError, KeyError) as e:
+        return {}, [str(e).strip("'\"")], []
+    return placements, warnings, _find_ghosts_fps(self.mp_fps, placements)
+
+
+def _mp_changed(self):
+    """Anything edited: the old Preview no longer applies."""
+    self.mp_preview = None
+    if hasattr(self, "mp_patch_btn"):
+        self.mp_patch_btn.configure(state="disabled")
+        for iid in self.mp_diff_tree.get_children():
+            self.mp_diff_tree.delete(iid)
+    self._mp_refresh_subparts()
+
+
+def _mp_refresh_subparts(self):
+    placements, warnings, ghosts = self._mp_compute()
+    selected = self.mp_sub_tree.selection()
+    for iid in self.mp_sub_tree.get_children():
+        self.mp_sub_tree.delete(iid)
+    entry = self._mp_parent_entry()
+    for i, sub in enumerate(entry["subparts"] if entry else []):
+        sub = _subpart_with_defaults(sub)
+        p = placements.get(sub["ref"])
+        cpl = f"{p['cpl_x']:.3f} / {p['cpl_y']:.3f} / {p['rotation']:g}" if p else "—"
+        dx, dy = sub["xy_offset_mm"]
+        self.mp_sub_tree.insert("", "end", iid=str(i), values=(
+            sub["ref"], sub["mode"], sub["pads"] if sub["mode"] == "pads" else "",
+            sub["comment"], sub["footprint"], sub["lcsc"], f"{sub['rotation_offset']:g}",
+            f"{dx:g}, {dy:g}", cpl))
+    for iid in selected:
+        if self.mp_sub_tree.exists(iid):
+            self.mp_sub_tree.selection_set(iid)
+    for g in ghosts:
+        if g["distance_mm"] > _MULTIPART_PRESET_TOLERANCE_MM:
+            warnings.append(f"{g['ref']} is also on the board as its own footprint, "
+                            f"{g['distance_mm']:.2f} mm from the computed spot (drawn in red).")
+    self.mp_warn_var.set("\n".join("⚠ " + w for w in warnings))
+    self._mp_redraw(placements, ghosts)
+
+
+def _mp_board_to_canvas(self, x: float, y: float) -> Tuple[float, float]:
+    scale, ox, oy, minx, miny = self._mp_view
+    return ox + (x - minx) * scale, oy + (y - miny) * scale
+
+
+def _mp_redraw(self, placements=None, ghosts=None):
+    c = self.mp_canvas
+    c.delete("all")
+    fp = self.mp_fps.get(self._mp_current_ref())
+    if fp is None:
+        self._mp_view = None
+        c.create_text(12, 12, anchor="nw", fill=COLORS['text_muted'],
+                      text="Load a project and pick the parent footprint.")
+        return
+    if placements is None:
+        placements, _warnings, ghosts = self._mp_compute()
+    entry = self._mp_parent_entry()
+    subs = [_subpart_with_defaults(s) for s in (entry["subparts"] if entry else [])]
+    my_ghosts = [g for g in ghosts or [] if g["ref"] in {s["ref"] for s in subs}]
+
+    # Group colour per pad number
+    pad_color = {}
+    for i, sub in enumerate(subs):
+        if sub["mode"] == "pads":
+            try:
+                for num in parse_pad_spec(sub["pads"]):
+                    pad_color.setdefault(num, _MP_GROUP_COLORS[i % len(_MP_GROUP_COLORS)])
+            except ValueError:
+                pass
+
+    pad_boxes = [(_pad_board_box(fp, p), p) for p in fp["pads"]]
+    lines = [(_fp_to_board(fp, *a), _fp_to_board(fp, *b)) for a, b in fp["lines"]]
+    ghost_boxes = []
+    for g in my_ghosts:
+        gfp = self.mp_fps[g["ref"]]
+        boxes = [_pad_board_box(gfp, p) for p in gfp["pads"]] or [(g["board_x"], g["board_y"]) * 2]
+        ghost_boxes.append((g, (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                max(b[2] for b in boxes), max(b[3] for b in boxes))))
+
+    xs = [b[0] for b, _ in pad_boxes] + [b[2] for b, _ in pad_boxes]
+    ys = [b[1] for b, _ in pad_boxes] + [b[3] for b, _ in pad_boxes]
+    for a, b in lines:
+        xs += [a[0], b[0]]
+        ys += [a[1], b[1]]
+    for _g, b in ghost_boxes:
+        xs += [b[0], b[2]]
+        ys += [b[1], b[3]]
+    for p in placements.values():
+        if p["parent"] == fp["ref"]:
+            xs.append(p["board_x"])
+            ys.append(p["board_y"])
+    if not xs:
+        xs, ys = [fp["x"] - 5, fp["x"] + 5], [fp["y"] - 5, fp["y"] + 5]
+    w, h = max(c.winfo_width(), 50), max(c.winfo_height(), 50)
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    margin = 40
+    scale = min((w - 2 * margin) / max(maxx - minx, 1e-3), (h - 2 * margin) / max(maxy - miny, 1e-3))
+    ox = (w - (maxx - minx) * scale) / 2
+    oy = (h - (maxy - miny) * scale) / 2
+    self._mp_view = (scale, ox, oy, minx, miny)
+    to_c = self._mp_board_to_canvas
+
+    for a, b in lines:
+        c.create_line(*to_c(*a), *to_c(*b), fill=COLORS['text_muted'], dash=(3, 3))
+    for (x1, y1, x2, y2), pad in pad_boxes:
+        color = pad_color.get(pad["number"], COLORS['border'])
+        if pad["type"] == "np_thru_hole":
+            c.create_oval(*to_c(x1, y1), *to_c(x2, y2), outline=COLORS['text_muted'])
+        else:
+            c.create_rectangle(*to_c(x1, y1), *to_c(x2, y2), fill=color, outline="")
+
+    # Pin-1 marker: lowest-numbered pad of each group
+    for i, sub in enumerate(subs):
+        if sub["mode"] != "pads":
+            continue
+        try:
+            wanted = parse_pad_spec(sub["pads"])
+        except ValueError:
+            continue
+        group = [p for p in fp["pads"] if p["number"] in wanted]
+        if group:
+            first = min(group, key=lambda p: _ref_sort_key(p["number"]))
+            px, py = to_c(*_fp_to_board(fp, first["x"], first["y"]))
+            c.create_oval(px - 6, py - 6, px + 6, py + 6, outline=COLORS['text'], width=2)
+            c.create_text(px - 8, py - 8, anchor="se", fill=COLORS['text_muted'], font=("Segoe UI", 8),
+                          text=f"pin {first['number']}")
+
+    # Ghost footprints left on the board
+    for g, (x1, y1, x2, y2) in ghost_boxes:
+        target = placements[g["ref"]]
+        bad = g["distance_mm"] > _MULTIPART_PRESET_TOLERANCE_MM
+        color = COLORS['error'] if bad else COLORS['text_muted']
+        c.create_rectangle(*to_c(x1, y1), *to_c(x2, y2), outline=color, dash=(4, 2))
+        if not bad:  # ghost already sits on the computed spot
+            continue
+        c.create_line(*to_c(g["board_x"], g["board_y"]),
+                      *to_c(target["board_x"], target["board_y"]), fill=color, dash=(2, 2), arrow="last")
+        gx, gy = to_c(x1, y2)
+        c.create_text(gx, gy + 4, anchor="nw", fill=color, font=("Segoe UI", 8),
+                      text=f"ghost {g['ref']}: {g['distance_mm']:.2f} mm off")
+
+    # Computed sub-part centres
+    sel = self.mp_sub_tree.selection()
+    sel_ref = subs[int(sel[0])]["ref"] if sel and int(sel[0]) < len(subs) else None
+    for i, sub in enumerate(subs):
+        p = placements.get(sub["ref"])
+        if not p:
+            continue
+        x, y = to_c(p["board_x"], p["board_y"])
+        color = _MP_GROUP_COLORS[i % len(_MP_GROUP_COLORS)]
+        r = 14 if sub["ref"] == sel_ref else 10
+        c.create_line(x - r, y, x + r, y, fill=COLORS['text'], width=2)
+        c.create_line(x, y - r, x, y + r, fill=COLORS['text'], width=2)
+        c.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=2)
+        c.create_text(x, y + r + 6, anchor="n", fill=COLORS['text'], font=("Segoe UI", 9, "bold"),
+                      text=f"{sub['ref']}  X {p['cpl_x']:.3f}  Y {p['cpl_y']:.3f}  R {p['rotation']:g}")
+
+
+def _mp_canvas_click(self, event):
+    """Place an offset-mode sub-part where the preview was clicked."""
+    fp = self.mp_fps.get(self._mp_current_ref())
+    if fp is None or self._mp_view is None:
+        return
+    scale, ox, oy, minx, miny = self._mp_view
+    lx, ly = _board_to_fp(fp, minx + (event.x - ox) / scale, miny + (event.y - oy) / scale)
+    lx, ly = round(lx, 3) + 0.0, round(ly, 3) + 0.0
+    if self._mp_edit and self._mp_edit["dlg"].winfo_exists():
+        v = self._mp_edit["vars"]
+        if v["mode"].get() == "offset":
+            v["dx"].set(f"{lx:g}")
+            v["dy"].set(f"{ly:g}")
+        return
+    entry = self._mp_parent_entry()
+    sel = self.mp_sub_tree.selection()
+    if not (entry and sel):
+        return
+    sub = entry["subparts"][int(sel[0])]
+    if sub.get("mode", "pads") != "offset":
+        self.mp_warn_var.set("Clicking places offset-mode sub-parts only. "
+                             f"{sub['ref']} is placed from its pads.")
+        return
+    sub["xy_offset_mm"] = [lx, ly]
+    self._mp_changed()
+
+
+def _mp_apply_preset(self):
+    name = self.mp_preset_var.get()
+    preset = multipart_presets_all().get(name)
+    if not preset or not self._mp_current_ref():
+        messagebox.showwarning("No Parent", "Load a project and pick the parent footprint first.")
+        return
+    entry = self._mp_parent_entry(create=True)
+    if entry["subparts"] and not messagebox.askyesno(
+            "Replace Sub-parts?", f"Replace the {len(entry['subparts'])} sub-part(s) of "
+                                  f"{entry['ref']} with the preset '{name}'?"):
+        return
+    entry["subparts"] = apply_preset(preset)
+    entry["preset"] = name
+    self._mp_changed()
+
+
+def _mp_save_preset(self):
+    entry = self._mp_parent_entry()
+    if not entry or not entry["subparts"]:
+        messagebox.showwarning("Nothing to Save", "Add sub-parts to the parent first.")
+        return
+    dlg = tk.Toplevel(self)
+    dlg.title("Save as Preset")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    dlg.grab_set()
+    name = tk.StringVar(value=entry.get("preset", "") if entry.get("preset") not in MULTIPART_PRESETS else "")
+    ttk.Label(dlg, text="Preset name:").pack(anchor="w", padx=12, pady=(12, 4))
+    ttk.Entry(dlg, textvariable=name, width=48).pack(fill="x", padx=12)
+    ttk.Label(dlg, text="Saves this parent's sub-parts, including measured pad centres, "
+                        "so the next board like this is one click.",
+              foreground=COLORS['text_muted'], wraplength=380, justify="left").pack(anchor="w", padx=12, pady=6)
+
+    def do_save():
+        n = name.get().strip()
+        if not n:
+            messagebox.showwarning("No Name", "Type a name for the preset.", parent=dlg)
+            return
+        placements, _warnings, _ghosts = self._mp_compute()
+        subs = []
+        for sub in entry["subparts"]:
+            sub = {k: v for k, v in _subpart_with_defaults(sub).items() if k != "expect_local_mm"}
+            p = placements.get(sub["ref"])
+            if sub["mode"] == "pads" and p and p["pad_center_local"]:
+                sub["expect_local_mm"] = [round(v, 3) + 0.0 for v in p["pad_center_local"]]
+            subs.append(sub)
+        try:
+            multipart_preset_save_user(n, {"subparts": subs})
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Save Failed", str(e), parent=dlg)
+            return
+        entry["preset"] = n
+        dlg.destroy()
+        self._mp_refresh_presets()
+        self.mp_preset_var.set(n)
+        messagebox.showinfo("Preset Saved", f"Saved preset '{n}' to\n{_multipart_presets_file()}")
+
+    btns = ttk.Frame(dlg)
+    btns.pack(fill="x", padx=12, pady=12)
+    ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+    ttk.Button(btns, text="Save Preset", command=do_save, style="Accent.TButton").pack(side="right", padx=4)
+
+
+def _mp_add_subpart(self):
+    if not self._mp_current_ref():
+        messagebox.showwarning("No Parent", "Load a project and pick the parent footprint first.")
+        return
+    entry = self._mp_parent_entry(create=True)
+    taken = {s["ref"] for p in self.mp_config["parents"] for s in p["subparts"]}
+    n = 1
+    while f"J{n}" in taken:
+        n += 1
+    entry["subparts"].append(_subpart_with_defaults({"ref": f"J{n}"}))
+    self._mp_changed()
+    self._mp_edit_subpart(len(entry["subparts"]) - 1, is_new=True)
+
+
+def _mp_remove_subpart(self):
+    entry = self._mp_parent_entry()
+    sel = self.mp_sub_tree.selection()
+    if not (entry and sel):
+        return
+    del entry["subparts"][int(sel[0])]
+    self._mp_changed()
+
+
+def _mp_edit_subpart(self, index: Optional[int] = None, is_new: bool = False):
+    """Edit one sub-part. The preview follows the fields as you type; Cancel puts it back."""
+    entry = self._mp_parent_entry()
+    if index is None:
+        sel = self.mp_sub_tree.selection()
+        if not sel:
+            return
+        index = int(sel[0])
+    if not entry or index >= len(entry["subparts"]):
+        return
+    if self._mp_edit and self._mp_edit["dlg"].winfo_exists():
+        self._mp_edit["dlg"].destroy()
+    orig = json.loads(json.dumps(entry["subparts"][index]))
+    sub = _subpart_with_defaults(orig)
+    self.mp_sub_tree.selection_set(str(index))
+
+    dlg = tk.Toplevel(self)
+    dlg.title(f"Sub-part of {entry['ref']}")
+    dlg.configure(bg=COLORS['bg'])
+    dlg.transient(self)
+    form = ttk.Frame(dlg)
+    form.pack(fill="both", expand=True, padx=12, pady=12)
+    form.grid_columnconfigure(1, weight=1)
+    v = {k: tk.StringVar(value=str(sub[k])) for k in ("ref", "mode", "pads", "comment", "footprint", "lcsc")}
+    v["rot"] = tk.StringVar(value=f"{sub['rotation_offset']:g}")
+    v["dx"] = tk.StringVar(value=f"{sub['xy_offset_mm'][0]:g}")
+    v["dy"] = tk.StringVar(value=f"{sub['xy_offset_mm'][1]:g}")
+    fields = (("ref", "Reference (CPL Designator):"), ("mode", "Mode:"), ("pads", "Pads (e.g. 1-100, 101, EP):"),
+              ("comment", "Comment (BOM) / Val (CPL):"), ("footprint", "Footprint / Package:"),
+              ("lcsc", "LCSC:"), ("rot", "Rotation offset (°):"), ("dx", "X offset (mm):"),
+              ("dy", "Y offset (mm):"))
+    for r, (key, label) in enumerate(fields):
+        ttk.Label(form, text=label).grid(row=r, column=0, sticky="e", padx=(0, 6), pady=3)
+        if key == "mode":
+            ttk.Combobox(form, textvariable=v[key], values=["pads", "offset"], state="readonly",
+                         width=10).grid(row=r, column=1, sticky="w", pady=3)
+        else:
+            ttk.Entry(form, textvariable=v[key], width=40).grid(row=r, column=1, sticky="ew", pady=3)
+    err = tk.StringVar()
+    ttk.Label(form, textvariable=err, foreground=COLORS['warning'], wraplength=380,
+              justify="left").grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ttk.Label(form, text="Offsets are in the parent's frame. In offset mode, click the preview to place it.",
+              foreground=COLORS['text_muted'], font=("Segoe UI", 8)).grid(
+        row=len(fields) + 1, column=0, columnspan=2, sticky="w")
+
+    def read() -> dict:
+        out = dict(sub)
+        out.update({k: v[k].get().strip() for k in ("ref", "mode", "pads", "comment", "footprint", "lcsc")})
+        if not out["ref"]:
+            raise ValueError("Reference is required.")
+        try:
+            out["rotation_offset"] = float(v["rot"].get() or 0)
+            out["xy_offset_mm"] = [float(v["dx"].get() or 0), float(v["dy"].get() or 0)]
+        except ValueError:
+            raise ValueError("Rotation and offsets must be numbers.")
+        if out["rotation_offset"].is_integer():
+            out["rotation_offset"] = int(out["rotation_offset"])
+        if out["mode"] == "pads":
+            if not parse_pad_spec(out["pads"]):
+                raise ValueError("List the pads this part sits on, or switch to offset mode.")
+        return out
+
+    def live(*_a):
+        try:
+            entry["subparts"][index] = read()
+            err.set("")
+        except ValueError as e:
+            err.set(str(e))
+            return
+        self._mp_changed()
+
+    for var in v.values():
+        var.trace_add("write", live)
+
+    def close(restore: bool):
+        if restore:
+            if is_new:
+                del entry["subparts"][index]
+            else:
+                entry["subparts"][index] = orig
+        self._mp_edit = None
+        dlg.destroy()
+        self._mp_changed()
+
+    def ok():
+        try:
+            new = read()
+        except ValueError as e:
+            err.set(str(e))
+            return
+        others = {s["ref"] for p in self.mp_config["parents"] for i, s in enumerate(p["subparts"])
+                  if not (p is entry and i == index)}
+        if new["ref"] in others:
+            err.set(f"{new['ref']} is already a sub-part.")
+            return
+        if new["ref"] == entry["ref"]:
+            err.set("A sub-part can't use the parent's reference.")
+            return
+        entry["subparts"][index] = new
+        close(restore=False)
+
+    btns = ttk.Frame(dlg)
+    btns.pack(fill="x", padx=12, pady=(0, 12))
+    ttk.Button(btns, text="Cancel", command=lambda: close(restore=True)).pack(side="right", padx=4)
+    ttk.Button(btns, text="OK", command=ok, style="Accent.TButton").pack(side="right", padx=4)
+    dlg.protocol("WM_DELETE_WINDOW", lambda: close(restore=True))
+    self._mp_edit = {"dlg": dlg, "vars": v}
+
+
+def _mp_run_preview(self):
+    """Dry run: compute the patched CSVs and show what would change."""
+    if not self.mp_fps:
+        messagebox.showwarning("No Project", "Load a project first.")
+        return
+    config = self._mp_effective_config()
+    if not config["parents"]:
+        messagebox.showwarning("Nothing to Do", "Add sub-parts to a parent footprint first.")
+        return
+    placements, warnings, _ghosts = self._mp_compute()
+    if not placements:
+        messagebox.showerror("Can't Place Sub-parts", "\n".join(warnings))
+        return
+    self._mp_refresh_subparts()
+    files = {}
+    try:
+        for key in ("cpl", "bom"):
+            path = self.mp_paths[key]
+            if not path.exists():
+                continue
+            header, rows = read_csv_rows(path)
+            if key == "cpl":
+                new_rows, diff = patch_cpl(header, rows, config, placements)
+            else:
+                new_rows, diff = patch_bom(header, rows, config)
+            files[key] = {"path": path, "mtime": path.stat().st_mtime, "header": header,
+                          "rows": new_rows, "diff": diff}
+    except (OSError, ValueError) as e:
+        messagebox.showerror("CSV Error", str(e))
+        return
+    if "cpl" not in files:
+        messagebox.showerror("No CPL", f"Can't find the plugin's CPL:\n{self.mp_paths['cpl']}\n\n"
+                                       "Generate the fabrication files with the JLCPCB plugin first.")
+        return
+
+    for iid in self.mp_diff_tree.get_children():
+        self.mp_diff_tree.delete(iid)
+    order = {"removed": 0, "replaced": 1, "changed": 1, "added": 2, "unchanged": 3}
+    for key in ("cpl", "bom"):
+        for d in sorted(files.get(key, {}).get("diff", []), key=lambda d: order[d["kind"]]):
+            self.mp_diff_tree.insert("", "end", tags=(d["kind"],), values=(
+                key.upper(), d["kind"], d["ref"],
+                ", ".join(d["old"]) if d["old"] else "", ", ".join(d["new"]) if d["new"] else ""))
+    self.mp_preview = files
+    pending = any(d["kind"] != "unchanged" for f in files.values() for d in f["diff"])
+    self.mp_patch_btn.configure(state="normal" if pending else "disabled")
+    if "bom" not in files:
+        self.mp_warn_var.set((self.mp_warn_var.get() + "\n" if self.mp_warn_var.get() else "")
+                             + f"⚠ No BOM found ({self.mp_paths['bom'].name}); only the CPL will be patched.")
+
+
+def _mp_patch(self):
+    """Write the previewed CSVs (with .bak) and save the config."""
+    files = self.mp_preview
+    if not files:
+        messagebox.showwarning("Preview First", "Run Preview before patching.")
+        return
+    for f in files.values():
+        if not f["path"].exists() or f["path"].stat().st_mtime != f["mtime"]:
+            self._mp_changed()
+            messagebox.showwarning("CSV Changed", f"{f['path'].name} changed since the Preview "
+                                                  "(did the plugin run again?). Run Preview again.")
+            return
+    counts = {}
+    for f in files.values():
+        for d in f["diff"]:
+            if d["kind"] != "unchanged":
+                counts[d["kind"]] = counts.get(d["kind"], 0) + 1
+    summary = ", ".join(f"{n} {k}" for k, n in counts.items())
+    names = "\n".join(f"  {f['path'].name}" for f in files.values())
+    if not messagebox.askyesno("Patch CSVs?",
+                               f"Write these files ({summary})?\n\n{names}\n\n"
+                               f"Each is copied to <file>.csv.bak first. "
+                               f"The config is saved too."):
+        return
+    written = []
+    try:
+        for f in files.values():
+            if write_csv_with_backup(f["path"], f["header"], f["rows"]):
+                written.append(f["path"].name)
+        cfg = multipart_config_save(Path(self.mp_project.get()), self._mp_effective_config())
+    except OSError as e:
+        messagebox.showerror("Write Failed", str(e))
+        return
+    self._mp_load_project(Path(self.mp_project.get()), keep_config=True)
+    self._mp_run_preview()
+    messagebox.showinfo("Patched", "Wrote " + (", ".join(written) or "nothing (already patched)")
+                        + f"\nSaved {cfg.name}")
+
+
+def _mp_save_config(self):
+    if not self.mp_project.get():
+        messagebox.showwarning("No Project", "Load a project first.")
+        return
+    try:
+        path = multipart_config_save(Path(self.mp_project.get()), self._mp_effective_config())
+    except OSError as e:
+        messagebox.showerror("Save Failed", str(e))
+        return
+    messagebox.showinfo("Config Saved", f"Saved {path}")
+
+
+App._create_multipart_tab   = _create_multipart_tab
+App._mp_browse_project      = _mp_browse_project
+App._mp_reload              = _mp_reload
+App._mp_load_project        = _mp_load_project
+App._mp_select_parent       = _mp_select_parent
+App._mp_current_ref         = _mp_current_ref
+App._mp_parent_entry        = _mp_parent_entry
+App._mp_on_parent_change    = _mp_on_parent_change
+App._mp_on_drop_toggle      = _mp_on_drop_toggle
+App._mp_refresh_presets     = _mp_refresh_presets
+App._mp_effective_config    = _mp_effective_config
+App._mp_compute             = _mp_compute
+App._mp_changed             = _mp_changed
+App._mp_refresh_subparts    = _mp_refresh_subparts
+App._mp_board_to_canvas     = _mp_board_to_canvas
+App._mp_redraw              = _mp_redraw
+App._mp_canvas_click        = _mp_canvas_click
+App._mp_apply_preset        = _mp_apply_preset
+App._mp_save_preset         = _mp_save_preset
+App._mp_add_subpart         = _mp_add_subpart
+App._mp_remove_subpart      = _mp_remove_subpart
+App._mp_edit_subpart        = _mp_edit_subpart
+App._mp_run_preview         = _mp_run_preview
+App._mp_patch               = _mp_patch
+App._mp_save_config         = _mp_save_config
 
 
 # ═══════════════════════════════════════════════════════════════════════════
