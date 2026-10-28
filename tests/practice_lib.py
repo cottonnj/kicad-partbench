@@ -63,10 +63,10 @@ def symbol_lib(*blocks: str) -> str:
     return '(kicad_symbol_lib (version 20211014) (generator "practice")\n' + "".join(blocks) + ")\n"
 
 
-def footprint(name: str, npads: int, model: str | None = None) -> str:
+def footprint(name: str, npads: int, model: str | None = None, rotate: str = "0 0 0") -> str:
     pads = "".join(f'  (pad "{i + 1}" smd rect (at {i * 0.5:.2f} 0) (size 0.3 0.8) (layers "F.Cu" "F.Paste" "F.Mask"))\n'
                    for i in range(npads))
-    mdl = (f'  (model "{model}"\n    (offset (xyz 0 0 0))\n    (scale (xyz 1 1 1))\n    (rotate (xyz 0 0 0))\n  )\n'
+    mdl = (f'  (model "{model}"\n    (offset (xyz 0 0 0))\n    (scale (xyz 1 1 1))\n    (rotate (xyz {rotate}))\n  )\n'
            if model else "")
     return (f'(footprint "{name}" (version 20221018) (generator pcbnew)\n  (layer "F.Cu")\n  (attr smd)\n'
             f'  (fp_text reference "REF**" (at 0 -2) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))\n'
@@ -74,9 +74,20 @@ def footprint(name: str, npads: int, model: str | None = None) -> str:
             f'{pads}{mdl})\n')
 
 
-def vendor_zip(path: Path, mpn: str, ref: str, fp: str, npins: int, layout: str) -> None:
+# The (model ...) line each vendor ships inside its footprint, pointing at the
+# vendor's own folder layout. Real downloads have these; pass vendor_model=True.
+VENDOR_MODEL_LINES = {
+    "ultralibrarian": "${{KIPRJMOD}}/STEP/{fp}.step",
+    "snapeda": "${{KIPRJMOD}}/{mpn}.step",
+    "samacsys": "C:\\\\Users\\\\vendor\\\\SamacSys_Parts.3dshapes\\\\{mpn}.stp",
+}
+
+
+def vendor_zip(path: Path, mpn: str, ref: str, fp: str, npins: int, layout: str,
+               vendor_model: bool = False) -> None:
     sym = symbol_lib(symbol(mpn, ref, fp, npins, {"MPN": mpn}))
-    mod = footprint(fp, min(npins, 8))
+    model = VENDOR_MODEL_LINES[layout].format(fp=fp, mpn=mpn) if vendor_model else None
+    mod = footprint(fp, min(npins, 8), model, rotate="-90 0 0")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         if layout == "ultralibrarian":

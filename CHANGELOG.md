@@ -13,6 +13,8 @@ Versions before 6.1.0 were numbered inside the script header; see `git log` for 
 - Added feature tests that drive the real app against a generated practice library (`tests/practice_lib.py`, `tests/gui_harness.py`). Confirmed bugs are tracked as expected failures and in issues #2–#5.
 - The 3D Models, BOM Manager and Passives tabs are marked experimental (#1).
 - **Multi-part CPL** tab (experimental): place one schematic symbol as several parts in the JLCPCB plugin's BOM/CPL, such as the two 100-pin connectors of a Raspberry Pi CM5. Pad-range or offset placement, a built-in CM5 preset and your own presets, a board preview, a CSV diff and `.bak` backups. See `docs/multipart-cpl-spec.md`.
+- **Fix: imported 3D models didn't show in KiCad.** The model was copied into `<library>/3d/step`, but the footprint kept the vendor's own model path (`${KIPRJMOD}/STEP/…`, `C:\…\SamacSys_Parts.3dshapes\…`). Import now repoints that line at the copy and keeps the vendor's offset/scale/rotation. For parts imported before this fix, run **3D Models → Scan → Select All Suggested → Apply**.
+- Relative model paths (`../3d/step/…`) are the default everywhere, including the Assign 3D Model dialog.
 
 ## 6.1.0 (2026-09-22)
 

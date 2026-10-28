@@ -15,12 +15,15 @@ Run:  DISPLAY=:99 python3.12 -m unittest tests.test_features_import -v
 from __future__ import annotations
 
 import csv
+import inspect
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 from tkinter import ttk
 from unittest import mock
@@ -193,6 +196,91 @@ class ImportTestBase(GuiTestCase):
 
     def counters(self):
         return {k: v.get() for k, v in self.h.app.sum_vars.items()}
+
+
+class VendorModelPathTests(ImportTestBase):
+    """Real vendor footprints ship a (model ...) line pointing at the vendor's
+    own layout (${KIPRJMOD}/STEP/..., C:\\...). After import it must point at
+    the copy in <library>/3d/step, keeping the vendor's transforms."""
+
+    PART = ("TPS62133RGTR", "U", "QFN50P300X300X100-17N", 8)
+
+    def import_vendor(self, layout: str, relative: bool = True, **zip_kw):
+        for z in self.lib.zips.glob("*.zip"):
+            z.unlink()
+        mpn, ref, fp, n = self.PART
+        pl.vendor_zip(self.lib.zips / f"{layout}.zip", mpn, ref, fp, n, layout, vendor_model=True, **zip_kw)
+        self.h.app.rel_models.set(relative)
+        self.run_button()
+        self.assertEqual(self.h.errors(), [])
+        return self.lib.pretty / f"{fp}.kicad_mod"
+
+    def assert_points_at_copy(self, fp_file: Path, expected: str):
+        text = fp_file.read_text(encoding="utf-8")
+        self.assertEqual(models(fp_file), [expected])
+        resolved, exists = kp.resolve_model_path(expected, self.lib.pretty, self.lib.personal)
+        self.assertTrue(exists, f"{expected} -> {resolved} does not exist")
+        self.assertIn("(rotate (xyz -90 0 0))", text, "vendor transform was lost")
+        self.assertEqual(sexpr_problems(text), [])
+
+    def test_ultralibrarian_model_line_repointed(self):
+        fp = self.import_vendor("ultralibrarian")
+        self.assert_points_at_copy(fp, "../3d/step/QFN50P300X300X100-17N.step")
+
+    def test_snapeda_model_line_repointed(self):
+        fp = self.import_vendor("snapeda")
+        self.assert_points_at_copy(fp, "../3d/step/TPS62133RGTR.step")
+
+    def test_samacsys_windows_model_line_repointed(self):
+        fp = self.import_vendor("samacsys")
+        self.assert_points_at_copy(fp, "../3d/step/TPS62133RGTR.stp")
+
+    def test_relative_off_writes_personal_lib_dir(self):
+        fp = self.import_vendor("snapeda", relative=False)
+        self.assertEqual(models(fp), ["${PERSONAL_LIB_DIR}/3d/step/TPS62133RGTR.step"])
+
+    def test_relative_is_the_default(self):
+        self.assertTrue(self.h.app.rel_models.get())
+        self.assertTrue(inspect.signature(kp.process_one_package).parameters["force_relative_models"].default)
+
+    def test_renamed_vendor_file_repoints_broken_line(self):
+        # Footprint names X.wrl but the zip ships X.step: the broken line is replaced, not duplicated
+        for z in self.lib.zips.glob("*.zip"):
+            z.unlink()
+        mpn, ref, fp, n = self.PART
+        mod = pl.footprint(fp, 4, "${KIPRJMOD}/3D/old_name.wrl", rotate="-90 0 0")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(f"{mpn}.kicad_sym", pl.symbol_lib(pl.symbol(mpn, ref, fp, n)))
+            z.writestr(f"{fp}.kicad_mod", mod)
+            z.writestr(f"{mpn}.step", pl.STEP)
+        (self.lib.zips / "renamed.zip").write_bytes(buf.getvalue())
+        self.run_button()
+        self.assert_points_at_copy(self.lib.pretty / f"{fp}.kicad_mod", "../3d/step/TPS62133RGTR.step")
+
+    def test_multi_footprint_package_repoints_each(self):
+        for z in self.lib.zips.glob("*.zip"):
+            z.unlink()
+        mpn, ref, fp, n = self.PART
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(f"{mpn}.kicad_sym", pl.symbol_lib(pl.symbol(mpn, ref, fp, n)))
+            for name in (fp, fp + "_HAND"):
+                z.writestr(f"{name}.kicad_mod",
+                           pl.footprint(name, 4, f"${{KIPRJMOD}}/{mpn}.step", rotate="-90 0 0"))
+            z.writestr(f"{mpn}.step", pl.STEP)
+        (self.lib.zips / "two.zip").write_bytes(buf.getvalue())
+        self.run_button()
+        for name in (fp, fp + "_HAND"):
+            self.assert_points_at_copy(self.lib.pretty / f"{name}.kicad_mod", "../3d/step/TPS62133RGTR.step")
+
+    def test_reimport_is_idempotent(self):
+        fp = self.import_vendor("ultralibrarian")
+        first = fp.read_bytes()
+        self.h.app.skip_imported.set(False)
+        self.close_windows()
+        self.run_button()
+        self.assertEqual(fp.read_bytes(), first)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

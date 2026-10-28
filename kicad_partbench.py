@@ -706,7 +706,13 @@ def _choose_from_models(models, key, prefer="step"):
         return best[0]
     return None
 
-def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_dir: Path, use_relative: bool):
+def _repoint_model_block(block: str, new_path: str) -> str:
+    """Replace the path of a (model ...) block, keeping everything after it."""
+    m = re.match(r'\(model\s+(?:"[^"]*"|[^\s)]+)', block)
+    return f'(model "{new_path}"' + block[m.end():] if m else block
+
+
+def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_dir: Path, use_relative: bool = True):
 
     txt = mod_path.read_text(encoding="utf-8", errors="ignore")
     personal_root = mod_path.parent.parent  # parent of *.pretty is personal root
@@ -729,15 +735,30 @@ def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_di
         rel = f'${{PERSONAL_LIB_DIR}}/3d/{sub}/{model_path.name}'
         new_model_str = f'(model "{rel}")'
 
-    # Check if an equivalent model is already present (compare by filename, case-insensitive)
-    existing = [mm.group(1) or mm.group(2) for mm in re.finditer(r'\(model\s+(?:"([^"]+)"|([^\s)]+))', txt)]
+    # Vendor footprints usually ship with their own (model ...) line pointing
+    # at the vendor's folder layout (${KIPRJMOD}/STEP/x.step, C:\...\x.stp).
+    # Repoint that line at our copy instead of adding a second one, keeping
+    # its offset/scale/rotate, which place the body correctly.
+    blocks = _extract_model_blocks(txt)
     new_key = _norm_model_key(rel, relative_to_dir, personal_root)
-    for pstr in existing:
-        if _norm_model_key(pstr, relative_to_dir, personal_root) == new_key:
-            cleaned = _dedupe_models_in_text(txt, relative_to_dir, personal_root)
-            if cleaned != txt:
-                mod_path.write_text(cleaned, encoding="utf-8")
-            return
+    target = None
+    for blk in blocks:                       # same file name -> same model
+        if _norm_model_key(blk[2], relative_to_dir, personal_root) == new_key:
+            target = blk
+            break
+    if target is None:                       # file renamed by the vendor: take the first broken line
+        for blk in blocks:
+            if not resolve_model_path(blk[2], relative_to_dir, personal_root)[1]:
+                target = blk
+                break
+    if target is not None:
+        start, end, old_path, full = target
+        if old_path != rel:
+            txt = txt[:start] + _repoint_model_block(full, rel) + txt[end:]
+        cleaned = _dedupe_models_in_text(txt, relative_to_dir, personal_root)
+        if cleaned != mod_path.read_text(encoding="utf-8", errors="ignore"):
+            mod_path.write_text(cleaned, encoding="utf-8")
+        return
 
     # Append and then dedupe as a safety net
     if txt.rstrip().endswith(')'):
@@ -751,7 +772,7 @@ def _write_model_into_footprint(mod_path: Path, model_path: Path, relative_to_di
 def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, personal_sym: Path,
                         fp_nick="Personal_Footprints", autoset_fp=True, overwrite=False, mode="Ignore Properties",
                         ignore_footprint_for_dedupe=True, duplicate_mode="skip", dry_run=False, log=lambda *a: None,
-                        import_pair_models=True, prefer_model_ext="step", force_relative_models=False):
+                        import_pair_models=True, prefer_model_ext="step", force_relative_models=True):
     res = {
         "package": str(path), "kind": kind,
         "footprints_imported": 0, "footprints_skipped": 0, "footprints_errors": 0,
@@ -806,11 +827,18 @@ def process_one_package(kind: str, path: Path, personal: Path, fp_folder: str, p
                     for mod_path in fps_paths:
                         try:
                             txt = Path(mod_path).read_text(encoding="utf-8", errors="ignore")
-                            if re.search(r'\(model\s+', txt):  # already has model
-                                continue
+                            fp_dir = personal / fp_folder
+                            existing = [b[2] for b in _extract_model_blocks(txt)]
+                            by_name = {p.name.lower(): p for (_m, p) in dest_models}
+                            # A vendor line naming one of the copied models: repoint it
+                            best = next((by_name[_norm_model_key(e, fp_dir, personal)] for e in existing
+                                         if _norm_model_key(e, fp_dir, personal) in by_name), None)
+                            if best is None and any(resolve_model_path(e, fp_dir, personal)[1] for e in existing):
+                                continue  # already has a model that resolves
                             # match by module stem first
                             stem = Path(mod_path).stem
-                            best = _choose_from_models([p for (_m,p) in dest_models], stem, prefer=prefer_model_ext)
+                            if best is None:
+                                best = _choose_from_models([p for (_m,p) in dest_models], stem, prefer=prefer_model_ext)
                             if not best and sym_cands:
                                 # try symbol names/values
                                 for cand in sorted(sym_cands, key=len, reverse=True):
@@ -5353,13 +5381,13 @@ Features bug fixes and UI improvements.
         
         ttk.Label(format_frame, text="Path Format:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0,8))
         
-        path_format = tk.StringVar(value="personal_lib")
+        path_format = tk.StringVar(value="relative")
         
-        ttk.Radiobutton(format_frame, text='${PERSONAL_LIB_DIR}/3d/... (recommended)', 
-                       variable=path_format, value="personal_lib",
-                       command=lambda: update_preview()).pack(anchor="w", pady=2)
-        ttk.Radiobutton(format_frame, text="Relative path (..\\3d\\...)", 
+        ttk.Radiobutton(format_frame, text="Relative path (../3d/...) (recommended)", 
                        variable=path_format, value="relative",
+                       command=lambda: update_preview()).pack(anchor="w", pady=2)
+        ttk.Radiobutton(format_frame, text='${PERSONAL_LIB_DIR}/3d/...', 
+                       variable=path_format, value="personal_lib",
                        command=lambda: update_preview()).pack(anchor="w", pady=2)
         ttk.Radiobutton(format_frame, text="Absolute path (full path)", 
                        variable=path_format, value="absolute",

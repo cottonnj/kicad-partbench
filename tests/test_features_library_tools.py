@@ -380,18 +380,23 @@ class TestAssign3DModel(LibraryToolsTestBase):
         paths = self.assign(m, "Absolute path")
         self.assertEqual(paths, [m.as_posix()])  # KiCad paths use forward slashes on every OS
 
+    def test_default_format_is_relative(self):
+        m = self.model_file()
+        paths = self.assign(m, None)     # default radio
+        self.assertEqual(paths, ["../3d/step/ABM8-3225.step"])
+
     def test_personal_lib_format_for_model_in_3d_step(self):
         m = self.model_file()
-        paths = self.assign(m, None)     # default radio: ${PERSONAL_LIB_DIR}
+        paths = self.assign(m, "PERSONAL_LIB_DIR")
         self.assertEqual(paths, ["${PERSONAL_LIB_DIR}/3d/step/ABM8-3225.step"])
 
-    # BUG: default ${PERSONAL_LIB_DIR} format assumes the file is in <lib>/3d/step; a model picked elsewhere gets a dangling path (no copy, no warning)
+    # BUG: the ${PERSONAL_LIB_DIR} format assumes the file is in <lib>/3d/step; a model picked elsewhere gets a dangling path (no copy, no warning)
     @unittest.expectedFailure
     def test_personal_lib_format_for_model_outside_library_resolves(self):
         outside = self.lib.root / "vendor_models" / "ABM8-3225.step"
         outside.parent.mkdir()
         outside.write_text("ISO-10303-21;\n")
-        paths = self.assign(outside, None)
+        paths = self.assign(outside, "PERSONAL_LIB_DIR")
         self.assertEqual(len(paths), 1)
         resolved, exists = kp.resolve_model_path(paths[0], self.lib.pretty, self.lib.personal)
         self.assertTrue(exists, f"{paths[0]} -> {resolved} does not exist")
